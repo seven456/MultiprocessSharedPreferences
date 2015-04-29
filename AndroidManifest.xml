@@ -21,5 +21,10 @@
 		<service
 			android:name=".CoreService"
 			android:process=":core" />
+		<provider
+            android:name="com.android.zgj.utils.MultiprocessSharedPreferences"
+            android:authorities="com.android.zgj.MultiprocessSharedPreferences"
+            android:exported="false"
+            android:process=":core" />
 	</application>
 </manifest>

@@ -1,94 +1,133 @@
 /*
- * 创建日期：2013年11月22日 下午6:34:31
+ * 创建日期：2014年9月12日 下午0:0:02
  */
 package com.android.zgj.utils;
 
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileNotFoundException;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
+import java.lang.ref.SoftReference;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
-import java.util.Map.Entry;
 import java.util.Set;
-import java.util.WeakHashMap;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
 
-import org.xmlpull.v1.XmlPullParserException;
+import com.android.zgj.BuildConfig;
 
+import android.content.BroadcastReceiver;
+import android.content.ContentProvider;
+import android.content.ContentResolver;
+import android.content.ContentValues;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
-import android.os.Build;
-import android.os.Environment;
-import android.os.FileObserver;
-import android.os.Handler;
-import android.os.Looper;
-import android.os.SystemClock;
+import android.content.UriMatcher;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
+import android.content.pm.PackageManager.NameNotFoundException;
+import android.content.pm.ProviderInfo;
+import android.database.Cursor;
+import android.database.MatrixCursor;
+import android.net.Uri;
+import android.os.Bundle;
 import android.util.Log;
 
 /**
- * 支持多进程同步读写的SharedPreferences，基于源码android.app.SharedPreferencesImpl（Android 5.L_preview）修改；<br>
- * 系统源码android.app.SharedPreferencesImpl（Android 5.L_preview）虽然支持了 {@link Context#MODE_MULTI_PROCESS}，但依然有如下问题： <br>
- * 1、当多个进程同时写同一个文件时，有可能会导致文件损坏或者数据丢失； <br>
- * 2、当多个线程修改同一个文件时，必须使用getSharedPreferences方法才能检查并加载一次数据； <br>
- * 3、OnSharedPreferenceChangeListener不支持多进程； <br>
- * 解决方案： <br>
- * 1、在多进程同时写文件时使用本地文件独占锁FileLock（阻塞的），先加载文件中的数据和内存中的合并后再写入文件，解决文件损坏或者数据丢失问题；<br>
- * 2、在多个进程读文件时，当文件正在被修改，也使用文件独占锁（阻塞的），可以得到最新的数值；<br>
- * 3、由于文件锁在Linux平台是进程级别，同一进程内的多线程可以多次获得，使用ReentrantLock解决Android（Linux）平台FileLock只能控制进程间的文件锁，在同一个进程内的多线程之间无效和无法互斥的问题；<br>
- * 4、使用FileObserver解决多进程监听事件onSharedPreferenceChangeListener；<br>
- * 新增优化：
- * 1、新增：完全兼容本地已经存储的SharedPreferences文件的读写；<br>
- * 2、新增：每个SharedPreferences都使用FileObserver监听文件被修改情况，刷新每个进程中SharedPreferences对象中的数据，不再需要getSharedPreferences才能获得最新数据了；<br>
- * 3、新增：使用FileObserver监听文件变化后，与内存中的数据比对，OnSharedPreferenceChangeListener已经可以支持多进程监听；<br>
- * 4、修改：采用copy的方式备份主xml文件而不采用SharedPreferencesImpl原来的file.renameTo，是因为file.renameTo会导致FileObserver失效；
- * 5、新增：Edit对象的clear()方法删除内存中的数据后执行onSharedPreferenceChangeListener.onSharedPreferenceChanged(sharedPreferences, key)，系统原来的API不执行通知；<br>
- * 不足：<br>
- * 1、由于使用了进程级别文件锁和文件备份，会多丧失一点效率；<br>
- * <br>
- * 使用举例：<br>
- * 因为该类实现了系统标准的SharedPreferences接口，只要将“context.getSharedPreferences(name, mode)”改成“MultiprocessSharedPreferences.getSharedPreferences(context, name, mode)”即可；<br>
- * 另外mode的{@link Context#MODE_MULTI_PROCESS}状态已经不需要再使用了，因为默认已经支持；<br>
+ * 使用ContentProvider实现多进程SharedPreferences读写;<br>
+ * 1、ContentProvider天生支持多进程访问；<br>
+ * 2、使用内部私有BroadcastReceiver实现多进程OnSharedPreferenceChangeListener监听；<br>
+ * 
+ * 使用方法：AndroidManifest.xml中添加provider申明：<br>
+ * <pre>
+ * &lt;provider android:name="com.qihoo.appstore.utils.MultiprocessSharedPreferences2"
+ * android:authorities="com.qihoo.appstore.MultiprocessSharedPreferences"
+ * android:process="com.qihoo.appstore.MultiprocessSharedPreferences"
+ * android:exported="false" /&gt;
+ * &lt;!-- authorities属性里面最好使用包名做前缀，apk在安装时authorities同名的provider需要校验签名，否则无法安装；--!/&gt;<br>
+ * </pre>
+ * 
+ * ContentProvider方式实现要注意：<br>
+ * 1、当ContentProvider所在进程android.os.Process.killProcess(pid)时，会导致整个应用程序完全意外退出或者ContentProvider所在进程重启；<br>
+ * 重启报错信息：Acquiring provider <processName> for user 0: existing object's process dead；<br>
+ * 2、如果设备处在“安全模式”下，只有系统自带的ContentProvider才能被正常解析使用，因此put值时默认返回false，get值时默认返回null；<br>
+ * 
+ * 其他方式实现ContentProvider的问题：<br>
+ * 使用FileLock和FileObserver也可以实现多进程SharedPreferences读写，但是会有兼容性问题：<br>
+ * 1、某些设备上卸载程序时锁文件无法删除导致卸载残留，进而导致无法重新安装该程序（报INSTALL_FAILED_UID_CHANGED错误）；<br>
+ * 2、某些设备上FileLock会导致僵尸进程出现进而导致耗电；<br>
+ * 3、僵尸进程出现后，正常进程的FileLock会一直阻塞等待僵尸进程中的FileLock释放，导致进程一直阻塞；<br>
  * 
  * @author zhangguojun
- * @version 1.0
+ * @version	1.0
  * @since JDK1.6
  */
-public final class MultiprocessSharedPreferences implements SharedPreferences {
+public class MultiprocessSharedPreferences extends ContentProvider implements SharedPreferences {
 	private static final String TAG = "MultiprocessSharedPreferences";
-	private static final String TAG_TEMP = "MultiprocessSharedPreferences.temp";
-	private static final boolean DEBUG = true;
-	private static final WeakHashMap<String, MultiprocessSharedPreferences> sSharedPrefs = new WeakHashMap<String, MultiprocessSharedPreferences>();
+	public static final boolean DEBUG = BuildConfig.DEBUG;
+	private Context mContext;
+	private String mName;
+	private int mMode;
+	private boolean mIsSafeMode;
+	private List<SoftReference<OnSharedPreferenceChangeListener>> mListeners;
+	private BroadcastReceiver mReceiver;
 
-	private static final int BUFFER_SIZE = 16 * 1024;
-	private final File mFile;
-	private final File mBackupFile;
-	private final int mMode;
-	private FileLockUtil mFileLockUtil;
-	private FileObserver mFileObserver;
-
-	private final Map<String, Object> mMap; // guarded by 'this'
-	private boolean mLoaded = false; // guarded by 'this'
-	private long mStatTimestamp; // guarded by 'this'
-	private long mStatSize; // guarded by 'this'
-
-	private static final Object mContent = new Object();
-	private final WeakHashMap<OnSharedPreferenceChangeListener, Object> mListeners = new WeakHashMap<OnSharedPreferenceChangeListener, Object>();
+	private static String AUTHORITY;
+	private static volatile Uri AUTHORITY_URI;
+	private UriMatcher mUriMatcher;
+	private static final String KEY = "value";
+	private static final String KEY_NAME = "name";
+	private static final String PATH_WILDCARD = "*/";
+	private static final String PATH_GET_ALL = "getAll";
+	private static final String PATH_GET_STRING = "getString";
+	private static final String PATH_GET_INT = "getInt";
+	private static final String PATH_GET_LONG = "getLong";
+	private static final String PATH_GET_FLOAT = "getFloat";
+	private static final String PATH_GET_BOOLEAN = "getBoolean";
+	private static final String PATH_CONTAINS = "contains";
+	private static final String PATH_APPLY = "apply";
+	private static final String PATH_COMMIT = "commit";
+	private static final String PATH_REGISTER_ON_SHARED_PREFERENCE_CHANGE_LISTENER = "registerOnSharedPreferenceChangeListener";
+	private static final String PATH_UNREGISTER_ON_SHARED_PREFERENCE_CHANGE_LISTENER = "unregisterOnSharedPreferenceChangeListener";
+	private static final int GET_ALL = 1;
+	private static final int GET_STRING = 2;
+	private static final int GET_INT = 3;
+	private static final int GET_LONG = 4;
+	private static final int GET_FLOAT = 5;
+	private static final int GET_BOOLEAN = 6;
+	private static final int CONTAINS = 7;
+	private static final int APPLY = 8;
+	private static final int COMMIT = 9;
+	private static final int REGISTER_ON_SHARED_PREFERENCE_CHANGE_LISTENER = 10;
+	private static final int UNREGISTER_ON_SHARED_PREFERENCE_CHANGE_LISTENER = 11;
+	private Map<String, Integer> mListenersCount;
 
 	private static class ReflectionUtil {
 
-		public static File contextGetSharedPrefsFile(Context context, String name) {
+		public static ContentValues contentValuesNewInstance(HashMap<String, Object> values) {
 			try {
-				return (File) context.getClass().getMethod("getSharedPrefsFile", String.class).invoke(context, name);
+				Constructor<ContentValues> c = ContentValues.class.getDeclaredConstructor(new Class[] { HashMap.class }); // hide
+				c.setAccessible(true);
+				return c.newInstance(values);
+			} catch (IllegalArgumentException e) {
+				throw new RuntimeException(e);
+			} catch (IllegalAccessException e) {
+				throw new RuntimeException(e);
+			} catch (InvocationTargetException e) {
+				throw new RuntimeException(e);
+			} catch (NoSuchMethodException e) {
+				throw new RuntimeException(e);
+			} catch (InstantiationException e) {
+				throw new RuntimeException(e);
+			}
+		}
+
+		public static Editor editorPutStringSet(Editor editor, String key, Set<String> values) {
+			try {
+				Method method = editor.getClass().getDeclaredMethod("putStringSet", new Class[] { String.class, Set.class }); // Android 3.0
+				return (Editor) method.invoke(editor, key, values);
 			} catch (IllegalArgumentException e) {
 				throw new RuntimeException(e);
 			} catch (IllegalAccessException e) {
@@ -100,139 +139,60 @@ public final class MultiprocessSharedPreferences implements SharedPreferences {
 			}
 		}
 
-		public static int fileUtilsGetAttribute(String name) {
+		public static void editorApply(Editor editor) {
 			try {
-				Class<?> obj = Class.forName("android.os.FileUtils");
-				return (Integer) obj.getField(name).get(obj);
-			} catch (ClassNotFoundException e) {
-				throw new RuntimeException(e);
-			} catch (IllegalArgumentException e) {
-				throw new RuntimeException(e);
-			} catch (IllegalAccessException e) {
-				throw new RuntimeException(e);
-			} catch (NoSuchFieldException e) {
-				throw new RuntimeException(e);
-			}
-		}
-
-		public static int fileUtilsSetPermissions(String file, int mode, int uid, int gid) {
-			try {
-				Class<?> obj = Class.forName("android.os.FileUtils");
-				return (Integer) obj.getMethod("setPermissions", String.class, int.class, int.class, int.class).invoke(obj, file, mode, uid, gid);
-			} catch (ClassNotFoundException e) {
-				throw new RuntimeException(e);
+				Method method = editor.getClass().getDeclaredMethod("apply"); // Android 2.3
+				method.invoke(editor);
 			} catch (IllegalArgumentException e) {
 				throw new RuntimeException(e);
 			} catch (IllegalAccessException e) {
 				throw new RuntimeException(e);
 			} catch (InvocationTargetException e) {
 				throw new RuntimeException(e);
-			} catch (NoSuchMethodException e) {
-				throw new RuntimeException(e);
-			}
-		}
-
-		public static void queuedWorkAdd(Runnable finisher) {
-			try {
-				Class<?> obj = Class.forName("android.app.QueuedWork");
-				obj.getMethod("add", Runnable.class).invoke(obj, finisher);
-			} catch (ClassNotFoundException e) {
-				throw new RuntimeException(e);
-			} catch (IllegalArgumentException e) {
-				throw new RuntimeException(e);
-			} catch (IllegalAccessException e) {
-				throw new RuntimeException(e);
-			} catch (InvocationTargetException e) {
-				throw new RuntimeException(e);
-			} catch (NoSuchMethodException e) {
-				throw new RuntimeException(e);
-			}
-		}
-
-		public static void queuedWorkRemove(Runnable finisher) {
-			try {
-				Class<?> obj = Class.forName("android.app.QueuedWork");
-				obj.getMethod("remove", Runnable.class).invoke(obj, finisher);
-			} catch (ClassNotFoundException e) {
-				throw new RuntimeException(e);
-			} catch (IllegalArgumentException e) {
-				throw new RuntimeException(e);
-			} catch (IllegalAccessException e) {
-				throw new RuntimeException(e);
-			} catch (InvocationTargetException e) {
-				throw new RuntimeException(e);
-			} catch (NoSuchMethodException e) {
-				throw new RuntimeException(e);
-			}
-		}
-
-		public static ExecutorService queuedWorkSingleThreadExecutor() {
-			try {
-				Class<?> obj = Class.forName("android.app.QueuedWork");
-				return (ExecutorService) obj.getMethod("singleThreadExecutor").invoke(obj);
-			} catch (ClassNotFoundException e) {
-				throw new RuntimeException(e);
-			} catch (IllegalArgumentException e) {
-				throw new RuntimeException(e);
-			} catch (IllegalAccessException e) {
-				throw new RuntimeException(e);
-			} catch (InvocationTargetException e) {
-				throw new RuntimeException(e);
-			} catch (NoSuchMethodException e) {
-				throw new RuntimeException(e);
-			}
-		}
-
-		public static void xmlUtilsWriteMapXml(@SuppressWarnings("rawtypes") Map val, OutputStream out) throws XmlPullParserException, IOException {
-			try {
-				Class<?> obj = Class.forName("com.android.internal.util.XmlUtils");
-				obj.getMethod("writeMapXml", Map.class, OutputStream.class).invoke(obj, val, out);
-			} catch (ClassNotFoundException e) {
-				throw new RuntimeException(e);
-			} catch (IllegalArgumentException e) {
-				throw new RuntimeException(e);
-			} catch (IllegalAccessException e) {
-				throw new RuntimeException(e);
-			} catch (InvocationTargetException e) {
-				if (e.getCause() instanceof XmlPullParserException) {
-					throw (XmlPullParserException) e.getTargetException();
-				} else if (e.getCause() instanceof IOException) {
-					throw (IOException) e.getTargetException();
-				} else {
-					throw new RuntimeException(e);
-				}
-			} catch (NoSuchMethodException e) {
-				throw new RuntimeException(e);
-			}
-		}
-
-		@SuppressWarnings("rawtypes")
-		public static HashMap xmlUtilsReadMapXml(InputStream in) throws XmlPullParserException, IOException {
-			try {
-				Class<?> obj = Class.forName("com.android.internal.util.XmlUtils");
-				return (HashMap) obj.getMethod("readMapXml", InputStream.class).invoke(obj, in);
-			} catch (ClassNotFoundException e) {
-				throw new RuntimeException(e);
-			} catch (IllegalArgumentException e) {
-				throw new RuntimeException(e);
-			} catch (IllegalAccessException e) {
-				throw new RuntimeException(e);
-			} catch (InvocationTargetException e) {
-				if (e.getCause() instanceof XmlPullParserException) {
-					throw (XmlPullParserException) e.getTargetException();
-				} else if (e.getCause() instanceof IOException) {
-					throw (IOException) e.getTargetException();
-				} else {
-					throw new RuntimeException(e);
-				}
 			} catch (NoSuchMethodException e) {
 				throw new RuntimeException(e);
 			}
 		}
 	}
+	
+	private void checkInitAuthority(Context context) {
+		if (AUTHORITY_URI == null) {
+			synchronized (MultiprocessSharedPreferences.this) {
+				if (AUTHORITY_URI == null) {
+					AUTHORITY = queryAuthority(context);
+					AUTHORITY_URI = Uri.parse(ContentResolver.SCHEME_CONTENT + "://" + AUTHORITY);
+					if (DEBUG) {
+						Log.d(TAG, "checkInitAuthority.AUTHORITY = " + AUTHORITY);
+					}
+				}
+				if (AUTHORITY == null) {
+					throw new IllegalArgumentException("'AUTHORITY' initialize failed.");
+				}
+			}
+		}
+	}
 
+	private static String queryAuthority(Context context) {
+		PackageInfo packageInfos = null;
+		try {
+			packageInfos = context.getPackageManager().getPackageInfo(context.getPackageName(), PackageManager.GET_PROVIDERS);
+		} catch (NameNotFoundException e) {
+			if (DEBUG) {
+				e.printStackTrace();
+			}
+		}
+		if (packageInfos != null && packageInfos.providers != null) {
+			for (ProviderInfo providerInfo : packageInfos.providers) {
+				if (providerInfo.name.equals(MultiprocessSharedPreferences.class.getName())) {
+					return providerInfo.authority;
+				}
+			}
+		}
+		return null;
+	}
+	
 	/**
-	 * mode不需要使用{@link Context#MODE_MULTI_PROCESS}就可以支持多进程了；
+	 * mode不使用{@link Context#MODE_MULTI_PROCESS}特可以支持多进程了；
 	 * 
 	 * @param mode
 	 * 
@@ -240,340 +200,135 @@ public final class MultiprocessSharedPreferences implements SharedPreferences {
 	 * @see Context#MODE_WORLD_READABLE
 	 * @see Context#MODE_WORLD_WRITEABLE
 	 */
-	private MultiprocessSharedPreferences(Context context, String name, int mode) {
-		mFile = ReflectionUtil.contextGetSharedPrefsFile(context, name);
-		if (DEBUG) {
-			Log.d(TAG_TEMP, android.os.Process.myPid() + " MultiprocessSharedPreferences.file = " + mFile);
-		}
-		mBackupFile = makeBackupFile(mFile);
-		mMode = mode;
-		mLoaded = false;
-		mMap = new HashMap<String, Object>();
-		checkCreateFile();
-		createFileLock(context);
-		createFileObserver();
-		startLoadFromDisk(false);
-	}
-
-	private void checkCreateFile() {
-		try {
-			File parent = mFile.getParentFile();
-			if (!parent.exists()) {
-				if (parent.mkdirs()) {
-					int S_IRWXU = ReflectionUtil.fileUtilsGetAttribute("S_IRWXU");
-					int S_IRWXG = ReflectionUtil.fileUtilsGetAttribute("S_IRWXG");
-					int S_IXOTH = ReflectionUtil.fileUtilsGetAttribute("S_IXOTH");
-					ReflectionUtil.fileUtilsSetPermissions(parent.getPath(), S_IRWXU | S_IRWXG | S_IXOTH, -1, -1);
-				} else {
-					Log.e(TAG, "Couldn't create directory for SharedPreferences file " + mFile);
-				}
-			}
-			if (!mFile.exists()) {
-				mFile.createNewFile();
-			}
-		} catch (IOException e) {
-			Log.e(TAG, "Couldn't create SharedPreferences file " + mFile, e);
-		}
-	}
-
-	private void createFileLock(Context context) {
-		File fileLock = mFile;
-		// 解决外网某些设备在应用卸载后有残留，无法重新安装问题；
-		// 联系出现问题的用户后发现，使用系统自带的应用管理和第三方软件卸载都会导致卸载残留；
-		// 卸载后发现文件锁/data/data/<packageName>/xxx/xxx.lock文件在卸载应用时没有被删除，导致无法重装应用；
-		// Android4.1.1_r1及以上版本开始，在安装程序时，当有卸载残留（有/data/data/<packageName>目录存在）时新增错误提示“INSTALL_FAILED_UID_CHANGED”；
-		// Android4.1.1_r1及以上版，将文件锁文件存储到/sdcard/Android/data/<packageName>私有目录（该目录也会随程序的卸载而自动删除），不再存储到/data/data/<packageName>下面的私有目录；
-		if (Build.VERSION.SDK_INT >= 16) { // Android4.1.1_r1
-			// 从Android3.1开始支持PTP（图像传输协议）或MTP（媒体传输协议）功能，让连接的Camera和其他设备可以直接保持连接，所以无需再动态监听Sdcard的挂载状态；
-			if (Environment.MEDIA_MOUNTED.equals(Environment.getExternalStorageState())) {
-				fileLock = new File(Environment.getExternalStorageDirectory(), "Android" + File.separator + "data" + File.separator + context.getPackageName()
-						+ File.separator + "files" + File.separator + mFile.getName());
-			}
-		}
-		mFileLockUtil = new FileLockUtil(TAG, fileLock);
-	}
-
-	private void createFileObserver() {
-		mFileObserver = new FileObserver(mFile.getPath(), FileObserver.MODIFY) { // FileObserver只对已经存在的文件有效，所以在注册事件之前必须创建好文件；
-			@Override
-			public void onEvent(final int event, final String path) {
-				if (DEBUG) {
-					Log.d(TAG_TEMP, android.os.Process.myPid() + " createFileObserver.mFileObserver.onEvent.event = " + event);
-				}
-				startLoadFromDisk(true);
-			}
-		};
-		mFileObserver.startWatching();
-	}
-
-	private void destroyFileObserver() {
-		mFileObserver.stopWatching();
-	}
-
-	/**
-	 * 获取支持多进程的SharedPreferences；
-	 * 
-	 * @param context
-	 * @param name
-	 * @return
-	 * 
-	 * @see Context#MODE_PRIVATE
-	 * @see Context#MODE_WORLD_READABLE
-	 * @see Context#MODE_WORLD_WRITEABLE
-	 */
 	public static SharedPreferences getSharedPreferences(Context context, String name, int mode) {
-		MultiprocessSharedPreferences sp;
-		synchronized (sSharedPrefs) {
-			sp = sSharedPrefs.get(name);
-			if (DEBUG) {
-				Log.d(TAG_TEMP, android.os.Process.myPid() + " getSharedPreferences.loadFromDiskLocked.name = " + name + ", sp = " + sp);
-			}
-			if (sp == null) {
-				sp = new MultiprocessSharedPreferences(context, name, mode);
-				sSharedPrefs.put(name, sp);
-			}
-		}
-		return sp;
+		return new MultiprocessSharedPreferences(context, name, mode);
 	}
 
 	/**
-	 * 在应用销毁时调用（可选的，内部文件监控的观察者都是weak引用）；
+	 * @deprecated 此默认构造函数只用于父类ContentProvider在初始化时使用；
 	 */
-	public static void onApplicationDestroy() {
-		Iterator<Entry<String, MultiprocessSharedPreferences>> it = sSharedPrefs.entrySet().iterator();
-		while (it.hasNext()) {
-			Entry<String, MultiprocessSharedPreferences> entry = it.next();
-			MultiprocessSharedPreferences sp = entry.getValue();
-			if (sp != null) {
-				sp.destroyFileObserver();
-			}
-			it.remove();
-		}
+	@Deprecated
+	public MultiprocessSharedPreferences() {
+
 	}
 
-	private void startLoadFromDisk(final boolean isNeedNotify) {
-		synchronized (this) {
-			mLoaded = false;
-		}
-		new Thread(TAG + " startLoadFromDisk") {
-			@Override
-			public void run() {
-				synchronized (MultiprocessSharedPreferences.this) {
-					loadFromDiskLocked(isNeedNotify);
-				}
-			}
-		}.start();
+	private MultiprocessSharedPreferences(Context context, String name, int mode) {
+		mContext = context;
+		mName = name;
+		mMode = mode;
+		mIsSafeMode = context.getPackageManager().isSafeMode(); // 如果设备处在“安全模式”下，只有系统自带的ContentProvider才能被正常解析使用；
 	}
 
-	private void loadFromDiskLocked(boolean isNeedNotify) {
-		if (DEBUG) {
-			Log.d(TAG_TEMP, android.os.Process.myPid() + " loadFromDiskLocked.start");
-		}
-		mFileLockUtil.tryLock("loadFromDiskLocked");
-		try {
-			if (!mLoaded) {
-				if (mBackupFile.exists()) {
-					checkCreateFile();
-					destroyFileObserver();
-					createFileObserver();
-					if (copyFile(mBackupFile, mFile)) {
-						mBackupFile.delete();
-					}
-				}
-				// Debugging
-				if (mFile.exists() && !mFile.canRead()) {
-					Log.w(TAG, "Attempt to read preferences file " + mFile + " without permission");
-				}
-				Map<String, Object> map = null;
-				boolean hasFileChanged = hasFileChanged();
-				if (DEBUG) {
-					Log.d(TAG_TEMP, android.os.Process.myPid() + " loadFromDiskLocked.hasFileChanged = " + hasFileChanged);
-				}
-				if (hasFileChanged) {
-					map = readToMap(mFile);
-					if (map != null) {
-						Set<String> keysModified = updateMap(mMap, map, isNeedNotify);
-						mStatTimestamp = mFile.lastModified();
-						mStatSize = mFile.length();
-						notifyListeners(keysModified);
-						if (DEBUG) {
-							Log.d(TAG_TEMP, android.os.Process.myPid() + " loadFromDiskLocked.mMap = " + mMap);
-						}
-					}
-				}
-			}
-		} finally {
-			mLoaded = true;
-			notifyAll();
-			mFileLockUtil.unlock("loadFromDiskLocked");
-			if (DEBUG) {
-				Log.d(TAG_TEMP, android.os.Process.myPid() + " loadFromDiskLocked.end");
-			}
-		}
-	}
-
-	private Set<String> updateMap(Map<String, Object> oleMap, Map<String, Object> newMap, boolean getKeysModified) {
-		Set<String> keysModified = null;
-		if (getKeysModified) {
-			keysModified = new HashSet<String>();
-		}
-		Iterator<Entry<String, Object>> it = oleMap.entrySet().iterator();
-		while (it.hasNext()) {
-			Map.Entry<String, Object> entry = it.next();
-			String key = entry.getKey();
-			Object value = entry.getValue();
-			if (newMap.containsKey(key)) {
-				if (value != null && !value.equals(newMap.get(key)) || value == null && newMap.get(key) != null) {
-					entry.setValue(newMap.get(key)); // 更新；
-					if (getKeysModified) {
-						keysModified.add(key);
-					}
-				}
-				newMap.remove(key);
-			} else {
-				it.remove(); // 删除；
-				if (getKeysModified) {
-					keysModified.add(key);
-				}
-			}
-		}
-		Iterator<Entry<String, Object>> itAdd = newMap.entrySet().iterator();
-		while (itAdd.hasNext()) {
-			Map.Entry<String, Object> entry = itAdd.next();
-			String key = entry.getKey();
-			Object value = entry.getValue();
-			oleMap.put(key, value); // 新增；
-			if (getKeysModified) {
-				keysModified.add(key);
-			}
-			itAdd.remove();
-		}
-		return keysModified;
-	}
-
-	private static File makeBackupFile(File prefsFile) {
-		return new File(prefsFile.getPath() + ".bak");
-	}
-
-	private boolean hasFileChanged() {
-		return mStatTimestamp != mFile.lastModified() || mStatSize != mFile.length();
-	}
-
-	@Override
-	public void registerOnSharedPreferenceChangeListener(OnSharedPreferenceChangeListener listener) {
-		synchronized (this) {
-			mListeners.put(listener, mContent);
-		}
-	}
-
-	@Override
-	public void unregisterOnSharedPreferenceChangeListener(OnSharedPreferenceChangeListener listener) {
-		synchronized (this) {
-			mListeners.remove(listener);
-		}
-	}
-
-	private void awaitLoadedLocked() {
-		while (!mLoaded) {
-			try {
-				wait();
-			} catch (InterruptedException unused) {
-			}
-		}
-	}
-
+	@SuppressWarnings("unchecked")
 	@Override
 	public Map<String, ?> getAll() {
-		synchronized (this) {
-			awaitLoadedLocked();
-			// noinspection unchecked
-			return new HashMap<String, Object>(mMap);
-		}
+		return (Map<String, ?>) getValue(PATH_GET_ALL, null, null);
 	}
 
 	@Override
 	public String getString(String key, String defValue) {
-		synchronized (this) {
-			awaitLoadedLocked();
-			String v = (String) mMap.get(key);
-			return v != null ? v : defValue;
-		}
+		String v = (String) getValue(PATH_GET_STRING, key, defValue);
+		return v != null ? v : defValue;
 	}
 
 	// @Override // Android 3.0
-	@Override
 	public Set<String> getStringSet(String key, Set<String> defValues) {
 		synchronized (this) {
-			awaitLoadedLocked();
 			@SuppressWarnings("unchecked")
-			Set<String> v = (Set<String>) mMap.get(key);
+			Set<String> v = (Set<String>) getValue(PATH_GET_STRING, key, defValues);
 			return v != null ? v : defValues;
 		}
 	}
 
 	@Override
 	public int getInt(String key, int defValue) {
-		synchronized (this) {
-			awaitLoadedLocked();
-			Integer v = (Integer) mMap.get(key);
-			return v != null ? v : defValue;
-		}
+		Integer v = (Integer) getValue(PATH_GET_INT, key, defValue);
+		return v != null ? v : defValue;
 	}
 
 	@Override
 	public long getLong(String key, long defValue) {
-		synchronized (this) {
-			awaitLoadedLocked();
-			Long v = (Long) mMap.get(key);
-			return v != null ? v : defValue;
-		}
+		Long v = (Long) getValue(PATH_GET_LONG, key, defValue);
+		return v != null ? v : defValue;
 	}
 
 	@Override
 	public float getFloat(String key, float defValue) {
-		synchronized (this) {
-			awaitLoadedLocked();
-			Float v = (Float) mMap.get(key);
-			return v != null ? v : defValue;
-		}
+		Float v = (Float) getValue(PATH_GET_FLOAT, key, defValue);
+		return v != null ? v : defValue;
 	}
 
 	@Override
 	public boolean getBoolean(String key, boolean defValue) {
-		synchronized (this) {
-			awaitLoadedLocked();
-			Boolean v = (Boolean) mMap.get(key);
-			return v != null ? v : defValue;
-		}
+		Boolean v = (Boolean) getValue(PATH_GET_BOOLEAN, key, defValue);
+		return v != null ? v : defValue;
 	}
 
 	@Override
 	public boolean contains(String key) {
-		synchronized (this) {
-			awaitLoadedLocked();
-			return mMap.containsKey(key);
-		}
+		Boolean v = (Boolean) getValue(PATH_CONTAINS, key, null);
+		return v != null ? v : false;
 	}
 
 	@Override
 	public Editor edit() {
-		// TODO: remove the need to call awaitLoadedLocked() when
-		// requesting an editor. will require some work on the
-		// Editor, but then we should be able to do:
-		//
-		// context.getSharedPreferences(..).edit().putString(..).apply()
-		//
-		// ... all without blocking.
-		synchronized (this) {
-			awaitLoadedLocked();
-		}
 		return new EditorImpl();
 	}
 
-	// Return value from EditorImpl#commitToMemory()
-	private static class MemoryCommitResult {
-		public boolean changesMade; // any keys different?
-		public Set<String> keysModified; // may be null
+	@Override
+	public void registerOnSharedPreferenceChangeListener(OnSharedPreferenceChangeListener listener) {
+		synchronized (this) {
+			if (mListeners == null) {
+				mListeners = new ArrayList<SoftReference<OnSharedPreferenceChangeListener>>();
+			}
+			Boolean result = (Boolean) getValue(PATH_REGISTER_ON_SHARED_PREFERENCE_CHANGE_LISTENER, null, false);
+			if (result != null && result) {
+				mListeners.add(new SoftReference<OnSharedPreferenceChangeListener>(listener));
+				if (mReceiver == null) {
+					mReceiver = new BroadcastReceiver() {
+						@Override
+						public void onReceive(Context context, Intent intent) {
+							String name = intent.getStringExtra(KEY_NAME);
+							@SuppressWarnings("unchecked")
+							List<String> keysModified = (List<String>) intent.getSerializableExtra(KEY);
+							if (mName.equals(name) && keysModified != null) {
+								List<SoftReference<OnSharedPreferenceChangeListener>> listeners = new ArrayList<SoftReference<OnSharedPreferenceChangeListener>>(mListeners);
+								for (int i = keysModified.size() - 1; i >= 0; i--) {
+									final String key = keysModified.get(i);
+									for (SoftReference<OnSharedPreferenceChangeListener> srlistener : listeners) {
+										OnSharedPreferenceChangeListener listener = srlistener.get();
+										if (listener != null) {
+											listener.onSharedPreferenceChanged(MultiprocessSharedPreferences.this, key);
+										}
+									}
+								}
+							}
+						}
+					};
+					mContext.registerReceiver(mReceiver, new IntentFilter(makeAction(mName)));
+				}
+			}
+		}
+	}
+
+	@Override
+	public void unregisterOnSharedPreferenceChangeListener(OnSharedPreferenceChangeListener listener) {
+		synchronized (this) {
+			getValue(PATH_UNREGISTER_ON_SHARED_PREFERENCE_CHANGE_LISTENER, null, false);
+			if (mListeners != null) {
+				for (SoftReference<OnSharedPreferenceChangeListener> srlistener : mListeners) {
+					OnSharedPreferenceChangeListener listenerFromSR = srlistener.get();
+					if (listenerFromSR != null && listenerFromSR.equals(listener)) {
+						mListeners.remove(srlistener);
+					}
+				}
+				if (mListeners.isEmpty() && mReceiver != null) {
+					mContext.unregisterReceiver(mReceiver);
+					mReceiver = null;
+					mListeners = null;
+				}
+			}
+		}
 	}
 
 	public final class EditorImpl implements Editor {
@@ -583,19 +338,15 @@ public final class MultiprocessSharedPreferences implements SharedPreferences {
 		@Override
 		public Editor putString(String key, String value) {
 			synchronized (this) {
-				if (DEBUG) {
-					Log.d(TAG_TEMP, android.os.Process.myPid() + " putString.key = " + key + ", value = " + value);
-				}
 				mModified.put(key, value);
 				return this;
 			}
 		}
 
 		// @Override // Android 3.0
-		@Override
 		public Editor putStringSet(String key, Set<String> values) {
 			synchronized (this) {
-				mModified.put(key, values);
+				mModified.put(key, (values == null) ? null : new HashSet<String>(values));
 				return this;
 			}
 		}
@@ -635,7 +386,7 @@ public final class MultiprocessSharedPreferences implements SharedPreferences {
 		@Override
 		public Editor remove(String key) {
 			synchronized (this) {
-				mModified.put(key, this);
+				mModified.put(key, null);
 				return this;
 			}
 		}
@@ -650,331 +401,287 @@ public final class MultiprocessSharedPreferences implements SharedPreferences {
 
 		@Override
 		public void apply() {
-			final CountDownLatch writtenToDiskLatch = new CountDownLatch(1);
-			final Runnable awaitCommit = new Runnable() {
-				@Override
-				public void run() {
-					try {
-						writtenToDiskLatch.await();
-					} catch (InterruptedException ignored) {
-					}
-				}
-			};
-			ReflectionUtil.queuedWorkAdd(awaitCommit);
-			final Runnable writeToDiskRunnable = new Runnable() {
-				@Override
-				public void run() {
-					try {
-						innerCommit();
-					} finally {
-						writtenToDiskLatch.countDown();
-						awaitCommit.run();
-						ReflectionUtil.queuedWorkRemove(awaitCommit);
-					}
-				}
-			};
-			ReflectionUtil.queuedWorkSingleThreadExecutor().execute(writeToDiskRunnable);
-		}
-
-		// Returns true if any changes were made
-		private MemoryCommitResult commitToMemory() {
-			MemoryCommitResult mcr = new MemoryCommitResult();
-			boolean hasListeners = !mListeners.isEmpty();
-			if (hasListeners) {
-				mcr.keysModified = new HashSet<String>();
-			}
-			Map<String, Object> mapFile = null;
-			if (hasFileChanged()) {
-				mapFile = readToMap(mFile); // 本地文件中的数据比内存中的新；
-			}
-			synchronized (this) {
-				if (mClear) {
-					if (!mMap.isEmpty()) {
-						Iterator<Entry<String, Object>> it = mMap.entrySet().iterator();
-						while (it.hasNext()) {
-							Entry<String, Object> entry = it.next();
-							String key = entry.getKey();
-							if (mapFile == null || mapFile != null && !mapFile.containsKey(key)) {
-								it.remove(); // 删除；
-								if (hasListeners) {
-									mcr.keysModified.add(key);
-								}
-							}
-						}
-						mcr.changesMade = true;
-					}
-				}
-
-				if (hasListeners && mapFile != null) {
-					Set<String> keysModified = updateMap(mModified, mapFile, true);
-					if (keysModified != null) {
-						mcr.keysModified.addAll(keysModified);
-						keysModified.clear();
-					}
-				}
-				if (DEBUG) {
-					Log.d(TAG_TEMP, android.os.Process.myPid() + " " + android.os.Process.myTid() + " commitToMemory.start.mModified = " + mModified
-							+ ", mMap = " + mMap);
-				}
-				Iterator<Entry<String, Object>> it = mModified.entrySet().iterator();
-				while (it.hasNext()) {
-					Entry<String, Object> entry = it.next();
-					String key = entry.getKey();
-					Object value = entry.getValue();
-					// Android 5.L_preview : "this" is the magic value for a removal mutation. In addition,
-					// setting a value to "null" for a given key is specified to be
-					// equivalent to calling remove on that key.
-					if (value == this || value == null) {
-						if (mMap.containsKey(key)) {
-							mMap.remove(key);
-							if (hasListeners) {
-								mcr.keysModified.add(key);
-							}
-							mcr.changesMade = true;
-						}
-					} else {
-						if (!mMap.containsKey(key) || (mMap.containsKey(key) && !value.equals(mMap.get(key)))) {
-							mMap.put(key, value);
-							if (hasListeners) {
-								mcr.keysModified.add(key);
-							}
-							mcr.changesMade = true;
-						}
-					}
-					it.remove();
-				}
-				mModified.clear();
-				if (DEBUG) {
-					Log.d(TAG_TEMP, android.os.Process.myPid() + " " + android.os.Process.myTid() + " commitToMemory.end");
-				}
-			}
-			return mcr;
+			setValue(PATH_APPLY);
 		}
 
 		@Override
 		public boolean commit() {
-			if (Build.VERSION.SDK_INT >= 9) { // Android 2.3.1_r1
-				final CountDownLatch writtenToDiskLatch = new CountDownLatch(1);
-				final Runnable awaitCommit = new Runnable() {
-					@Override
-					public void run() {
-						try {
-							writtenToDiskLatch.await();
-						} catch (InterruptedException ignored) {
-						}
-					}
-				};
-				ReflectionUtil.queuedWorkAdd(awaitCommit);
-				try {
-					return innerCommit();
-				} finally {
-					writtenToDiskLatch.countDown();
-					awaitCommit.run();
-					ReflectionUtil.queuedWorkRemove(awaitCommit);
-				}
-			} else {
-				return innerCommit();
-			}
+			return setValue(PATH_COMMIT);
 		}
 
-		private boolean innerCommit() {
-			synchronized (MultiprocessSharedPreferences.this) {
-				if (DEBUG) {
-					Log.d(TAG_TEMP, android.os.Process.myPid() + " " + android.os.Process.myTid() + " commit.tryLock.start");
-				}
-				mFileLockUtil.tryLock("commit");
-				if (DEBUG) {
-					Log.d(TAG_TEMP, android.os.Process.myPid() + " " + android.os.Process.myTid() + " commit.tryLock.end");
-				}
-				try {
-					if (DEBUG) {
-						Log.d(TAG_TEMP, android.os.Process.myPid() + " " + android.os.Process.myTid() + " commit.try.start");
+		private boolean setValue(String pathSegment) {
+			if (mIsSafeMode) { // 如果设备处在“安全模式”，返回false；
+				return false;
+			} else {
+				synchronized (MultiprocessSharedPreferences.this) {
+					checkInitAuthority(mContext);
+					String[] selectionArgs = new String[] { String.valueOf(mMode), String.valueOf(mClear) };
+					synchronized (this) {
+						Uri uri = Uri.withAppendedPath(Uri.withAppendedPath(AUTHORITY_URI, mName), pathSegment);
+						ContentValues values = ReflectionUtil.contentValuesNewInstance((HashMap<String, Object>) mModified);
+						return mContext.getContentResolver().update(uri, values, null, selectionArgs) > 0;
 					}
-					boolean succeed = false;
-					MemoryCommitResult mcr = commitToMemory();
-					long time = SystemClock.elapsedRealtime();
-					if (!mcr.changesMade) {
-						succeed = true;
-					} else {
-						succeed = writeToFile(mMap);
-					}
-					if (DEBUG) {
-						Log.d(TAG_TEMP, android.os.Process.myPid() + " commit.time = " + (SystemClock.elapsedRealtime() - time) + ", mcr.changesMade = "
-								+ mcr.changesMade + ", succeed = " + succeed + ", mMap = " + mMap);
-					}
-					notifyListeners(mcr.keysModified);
-					return succeed;
-				} finally {
-					if (DEBUG) {
-						Log.d(TAG_TEMP, android.os.Process.myPid() + " " + android.os.Process.myTid() + " commit.finally.unlock");
-					}
-					mFileLockUtil.unlock("commit");
 				}
 			}
 		}
 	}
 
-	private void notifyListeners(final Set<String> keysModified) {
-		if (keysModified != null && !keysModified.isEmpty()) {
-			Runnable runnable = new Runnable() {
-				@Override
-				public void run() {
-					if (!mListeners.isEmpty()) {
-						Iterator<String> it = keysModified.iterator();
-						while (it.hasNext()) {
-							String key = it.next();
-							for (Entry<OnSharedPreferenceChangeListener, Object> entry : mListeners.entrySet()) {
-								entry.getKey().onSharedPreferenceChanged(MultiprocessSharedPreferences.this, key);
-							}
-							it.remove();
-						}
-					}
+	private Object getValue(String pathSegment, String key, Object defValue) {
+		if (mIsSafeMode) { // 如果设备处在“安全模式”，返回null；
+			return null;
+		} else {
+			checkInitAuthority(mContext);
+			Object v = null;
+			Uri uri = Uri.withAppendedPath(Uri.withAppendedPath(AUTHORITY_URI, mName), pathSegment);
+			String[] selectionArgs = new String[] { String.valueOf(mMode), key, defValue == null ? null : String.valueOf(defValue) };
+			Cursor cursor = mContext.getContentResolver().query(uri, null, null, selectionArgs, null);
+			if (cursor != null) {
+				Bundle bundle = cursor.getExtras();
+				if (bundle != null) {
+					v = bundle.get(KEY);
+					bundle.clear();
 				}
-			};
-			if (Looper.myLooper() == Looper.getMainLooper()) {
-				runnable.run();
-			} else {
-				// Run this function on the main thread.
-				new Handler(Looper.getMainLooper()).post(runnable);
+				cursor.close();
 			}
+			return v != null ? v : defValue;
 		}
 	}
 
-	private boolean writeToFile(Map<String, Object> map) {
-		if (DEBUG) {
-			Log.d(TAG_TEMP, android.os.Process.myPid() + " writeToFile");
-		}
-		if (mFile.exists()) {
-			if (!mBackupFile.exists()) {
-				// 这里采用copy而不采用SharedPreferencesImpl原来的file.renameTo是因为file.renameTo会导致FileObserver失效；
-				if (!copyFile(mFile, mBackupFile)) { // 先备份文件，防止kill时，数据丢失；
-					Log.e(TAG, "Couldn't copy file " + mFile + " to backup file " + mBackupFile);
-					return false;
+	private String makeAction(String name) {
+		return String.format("%1$s_%2$s", MultiprocessSharedPreferences.class.getName(), name);
+	}
+
+	@Override
+	public boolean onCreate() {
+		checkInitAuthority(getContext());
+		mUriMatcher = new UriMatcher(UriMatcher.NO_MATCH);
+		mUriMatcher.addURI(AUTHORITY, PATH_WILDCARD + PATH_GET_ALL, GET_ALL);
+		mUriMatcher.addURI(AUTHORITY, PATH_WILDCARD + PATH_GET_STRING, GET_STRING);
+		mUriMatcher.addURI(AUTHORITY, PATH_WILDCARD + PATH_GET_INT, GET_INT);
+		mUriMatcher.addURI(AUTHORITY, PATH_WILDCARD + PATH_GET_LONG, GET_LONG);
+		mUriMatcher.addURI(AUTHORITY, PATH_WILDCARD + PATH_GET_FLOAT, GET_FLOAT);
+		mUriMatcher.addURI(AUTHORITY, PATH_WILDCARD + PATH_GET_BOOLEAN, GET_BOOLEAN);
+		mUriMatcher.addURI(AUTHORITY, PATH_WILDCARD + PATH_CONTAINS, CONTAINS);
+		mUriMatcher.addURI(AUTHORITY, PATH_WILDCARD + PATH_APPLY, APPLY);
+		mUriMatcher.addURI(AUTHORITY, PATH_WILDCARD + PATH_COMMIT, COMMIT);
+		mUriMatcher.addURI(AUTHORITY, PATH_WILDCARD + PATH_REGISTER_ON_SHARED_PREFERENCE_CHANGE_LISTENER, REGISTER_ON_SHARED_PREFERENCE_CHANGE_LISTENER);
+		mUriMatcher.addURI(AUTHORITY, PATH_WILDCARD + PATH_UNREGISTER_ON_SHARED_PREFERENCE_CHANGE_LISTENER, UNREGISTER_ON_SHARED_PREFERENCE_CHANGE_LISTENER);
+		return true;
+	}
+
+	@Override
+	public Cursor query(Uri uri, String[] projection, String selection, String[] selectionArgs, String sortOrder) {
+		String name = uri.getPathSegments().get(0);
+		int mode = Integer.parseInt(selectionArgs[0]);
+		String key = selectionArgs[1];
+		String defValue = selectionArgs[2];
+		Bundle bundle = new Bundle();
+		switch (mUriMatcher.match(uri)) {
+			case GET_ALL:
+				bundle.putSerializable(KEY, (HashMap<String, ?>) getContext().getSharedPreferences(name, mode).getAll());
+				break;
+			case GET_STRING:
+				bundle.putString(KEY, getContext().getSharedPreferences(name, mode).getString(key, defValue));
+				break;
+			case GET_INT:
+				bundle.putInt(KEY, getContext().getSharedPreferences(name, mode).getInt(key, Integer.parseInt(defValue)));
+				break;
+			case GET_LONG:
+				bundle.putLong(KEY, getContext().getSharedPreferences(name, mode).getLong(key, Long.parseLong(defValue)));
+				break;
+			case GET_FLOAT:
+				bundle.putFloat(KEY, getContext().getSharedPreferences(name, mode).getFloat(key, Float.parseFloat(defValue)));
+				break;
+			case GET_BOOLEAN:
+				bundle.putBoolean(KEY, getContext().getSharedPreferences(name, mode).getBoolean(key, Boolean.parseBoolean(defValue)));
+				break;
+			case CONTAINS:
+				bundle.putBoolean(KEY, getContext().getSharedPreferences(name, mode).contains(key));
+				break;
+			case REGISTER_ON_SHARED_PREFERENCE_CHANGE_LISTENER: {
+				checkInitListenersCount();
+				Integer countInteger = mListenersCount.get(name);
+				int count = (countInteger == null ? 0 : countInteger) + 1;
+				mListenersCount.put(name, count);
+				countInteger = mListenersCount.get(name);
+				bundle.putBoolean(KEY, count == (countInteger == null ? 0 : countInteger));
+			}
+				break;
+			case UNREGISTER_ON_SHARED_PREFERENCE_CHANGE_LISTENER: {
+				checkInitListenersCount();
+				Integer countInteger = mListenersCount.get(name);
+				int count = (countInteger == null ? 0 : countInteger) - 1;
+				if (count <= 0) {
+					mListenersCount.remove(name);
+					bundle.putBoolean(KEY, !mListenersCount.containsKey(name));
 				} else {
-					setFilePermissionsFromMode(mBackupFile.getPath(), mMode, 0);
+					mListenersCount.put(name, count);
+					countInteger = mListenersCount.get(name);
+					bundle.putBoolean(KEY, count == (countInteger == null ? 0 : countInteger));
 				}
 			}
-		} else { // 假如其他未知情况下删除了文件，这里重新创建文件和文件监听器；
-			checkCreateFile();
-			createFileObserver();
+				break;
+			default:
+				throw new IllegalArgumentException("This is Unknown Uri：" + uri);
 		}
-		BufferedOutputStream bos = null;
-		// Attempt to write the file, delete the backup and return true as atomically as
-		// possible.  If any exception occurs, delete the new file; next time we will restore
-		// from the backup.
-		try {
-			FileOutputStream fos = new FileOutputStream(mFile);
-			bos = new BufferedOutputStream(fos, BUFFER_SIZE);
-			ReflectionUtil.xmlUtilsWriteMapXml(map, bos);
-			fos.getFD().sync();
-			setFilePermissionsFromMode(mFile.getPath(), mMode, 0);
-			mStatTimestamp = mFile.lastModified();
-			mStatSize = mFile.length();
-			// Writing was successful, delete the backup file if there is one.
-			mBackupFile.delete();
-			return true;
-		} catch (XmlPullParserException e) {
-			Log.w(TAG, "writeToFile: Got exception:", e);
-		} catch (FileNotFoundException e) {
-			Log.w(TAG, "writeToFile: Got exception:", e);
-		} catch (IOException e) {
-			Log.w(TAG, "writeToFile: Got exception:", e);
-		} finally {
-			try {
-				if (bos != null) {
-					bos.close();
-				}
-			} catch (IOException unused) {
-			}
-		}
-		// Clean up an unsuccessfully written file
-		if (mFile.exists()) {
-			try {
-				FileOutputStream fos = new FileOutputStream(mFile); // 只清空文件内容，不delete，delete会导致FileObserver失效；
-				fos.close();
-			} catch (Exception e) {
-				Log.e(TAG, "Couldn't clean up partially-written file " + mFile, e);
-			}
-		}
-		return false;
+		return new BundleCursor(bundle);
 	}
 
-	private boolean copyFile(File srcFile, File destFile) {
-		FileInputStream fis = null;
-		BufferedOutputStream bos = null;
-		try {
-			fis = new FileInputStream(srcFile);
-			bos = new BufferedOutputStream(new FileOutputStream(destFile), BUFFER_SIZE);
-			byte[] buffer = new byte[BUFFER_SIZE];
-			int len;
-			while ((len = fis.read(buffer)) != -1) {
-				bos.write(buffer, 0, len);
-			}
-			bos.flush();
-			return true;
-		} catch (IOException unused) {
-		} finally {
-			try {
-				if (fis != null) {
-					fis.close();
-				}
-				if (bos != null) {
-					bos.close();
-				}
-			} catch (IOException unused) {
-			}
-		}
-		return false;
+	@Override
+	public String getType(Uri uri) {
+		throw new UnsupportedOperationException("No external call");
 	}
 
-	private static void setFilePermissionsFromMode(String name, int mode, int extraPermissions) {
-		int S_IRUSR = ReflectionUtil.fileUtilsGetAttribute("S_IRUSR");
-		int S_IWUSR = ReflectionUtil.fileUtilsGetAttribute("S_IWUSR");
-		int S_IRGRP = ReflectionUtil.fileUtilsGetAttribute("S_IRGRP");
-		int S_IWGRP = ReflectionUtil.fileUtilsGetAttribute("S_IWGRP");
-		int S_IROTH = ReflectionUtil.fileUtilsGetAttribute("S_IROTH");
-		int S_IWOTH = ReflectionUtil.fileUtilsGetAttribute("S_IWOTH");
-		int perms = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | extraPermissions;
-		if ((mode & Context.MODE_WORLD_READABLE) != 0) {
-			perms |= S_IROTH;
-		}
-		if ((mode & Context.MODE_WORLD_WRITEABLE) != 0) {
-			perms |= S_IWOTH;
-		}
-		if (DEBUG) {
-			Log.i(TAG, "File " + name + ": mode=0x" + Integer.toHexString(mode) + ", perms=0x" + Integer.toHexString(perms));
-		}
-		ReflectionUtil.fileUtilsSetPermissions(name, perms, -1, -1);
+	@Override
+	public Uri insert(Uri uri, ContentValues values) {
+		throw new UnsupportedOperationException("No external insert");
+	}
+
+	@Override
+	public int delete(Uri uri, String selection, String[] selectionArgs) {
+		throw new UnsupportedOperationException("No external delete");
 	}
 
 	@SuppressWarnings("unchecked")
-	private Map<String, Object> readToMap(File file) {
-		Map<String, Object> map = null;
-		BufferedInputStream bis = null;
-		try {
-			if (file.canRead()) {
-				bis = new BufferedInputStream(new FileInputStream(file), BUFFER_SIZE);
-				map = ReflectionUtil.xmlUtilsReadMapXml(bis);
-			}
-		} catch (XmlPullParserException e) {
-			Log.w(TAG, "readToMap", e);
-		} catch (FileNotFoundException e) {
-			Log.w(TAG, "readToMap", e);
-		} catch (IOException e) {
-			Log.w(TAG, "readToMap", e);
-		} catch (AssertionError e) { // 解决外网崩溃：java.lang.AssertionError at android.util.Xml.newPullParser(Xml.java:97) at com.android.internal.util.XmlUtils.readMapXml(XmlUtils.java:492)
-			Log.w(TAG, "readToMap", e);
-		} catch (ArrayIndexOutOfBoundsException e) { // 特殊机型（LG D958）有时候报：java.lang.ArrayIndexOutOfBoundsException: src.length=8192 srcPos=1 dst.length=8192 dstPos=0 length=-1 at java.lang.System.arraycopy(Native Method) at org.kxml2.io.KXmlParser.fillBuffer(KXmlParser.java:1489)
-			Log.w(TAG, "readToMap", e);
-			// TODO 这个异常不知道要不要删除文件？
-		} finally {
-			try {
-				if (bis != null) {
-					bis.close();
+	@Override
+	public int update(Uri uri, ContentValues values, String selection, String[] selectionArgs) {
+		int result = 0;
+		String name = uri.getPathSegments().get(0);
+		int mode = Integer.parseInt(selectionArgs[0]);
+		SharedPreferences preferences = getContext().getSharedPreferences(name, mode);
+		int match = mUriMatcher.match(uri);
+		switch (match) {
+			case APPLY:
+			case COMMIT:
+				boolean hasListeners = mListenersCount != null && mListenersCount.get(name) != null && mListenersCount.get(name) > 0;
+				ArrayList<String> keysModified = null;
+				Map<String, Object> map = null;
+				if (hasListeners) {
+					keysModified = new ArrayList<String>();
+					map = (Map<String, Object>) preferences.getAll();
 				}
-			} catch (IOException unused) {
-			}
+				Editor editor = preferences.edit();
+				boolean clear = Boolean.parseBoolean(selectionArgs[1]);
+				if (clear) {
+					if (hasListeners && !map.isEmpty()) {
+						for (Map.Entry<String, Object> entry : map.entrySet()) {
+							keysModified.add(entry.getKey());
+						}
+					}
+					editor.clear();
+				}
+				for (Map.Entry<String, Object> entry : values.valueSet()) {
+					String k = entry.getKey();
+					Object v = entry.getValue();
+					// Android 5.L_preview : "this" is the magic value for a removal mutation. In addition,
+					// setting a value to "null" for a given key is specified to be
+					// equivalent to calling remove on that key.
+					if (v instanceof EditorImpl || v == null) {
+						editor.remove(k);
+						if (hasListeners && map.containsKey(k)) {
+							keysModified.add(k);
+						}
+					} else {
+						if (hasListeners && (!map.containsKey(k) || (map.containsKey(k) && !v.equals(map.get(k))))) {
+							keysModified.add(k);
+						}
+					}
+
+					if (v instanceof String) {
+						editor.putString(k, (String) v);
+					} else if (v instanceof Set) {
+						ReflectionUtil.editorPutStringSet(editor, k, (Set<String>) v); // Android 3.0
+					} else if (v instanceof Integer) {
+						editor.putInt(k, (Integer) v);
+					} else if (v instanceof Long) {
+						editor.putLong(k, (Long) v);
+					} else if (v instanceof Float) {
+						editor.putFloat(k, (Float) v);
+					} else if (v instanceof Boolean) {
+						editor.putBoolean(k, (Boolean) v);
+					}
+				}
+				if (hasListeners && keysModified.isEmpty()) {
+					result = 1;
+				} else {
+					switch (match) {
+						case APPLY:
+							ReflectionUtil.editorApply(editor); // Android 2.3
+							result = 1;
+							// Okay to notify the listeners before it's hit disk
+							// because the listeners should always get the same
+							// SharedPreferences instance back, which has the
+							// changes reflected in memory.
+							notifyListeners(name, keysModified);
+							break;
+						case COMMIT:
+							if (editor.commit()) {
+								result = 1;
+								notifyListeners(name, keysModified);
+							}
+							break;
+						default:
+							break;
+					}
+				}
+				values.clear();
+				break;
+			default:
+				throw new IllegalArgumentException("This is Unknown Uri：" + uri);
 		}
-		return map;
+		return result;
+	}
+	
+	@Override
+	public void onLowMemory() {
+		if (mListenersCount != null) {
+			mListenersCount.clear();
+		}
+		super.onLowMemory();
+	}
+	
+	@Override
+	public void onTrimMemory(int level) {
+		if (mListenersCount != null) {
+			mListenersCount.clear();
+		}
+		super.onTrimMemory(level);
+	}
+	
+	private void checkInitListenersCount() {
+		if (mListenersCount == null) {
+			mListenersCount = new HashMap<String, Integer>();
+		}
+	}
+
+	private void notifyListeners(String name, ArrayList<String> keysModified) {
+		if (keysModified != null && !keysModified.isEmpty()) {
+			Intent intent = new Intent();
+			intent.setAction(makeAction(name));
+			intent.setPackage(getContext().getPackageName());
+			intent.putExtra(KEY_NAME, name);
+			intent.putExtra(KEY, keysModified);
+			getContext().sendBroadcast(intent);
+		}
+	}
+
+	private static final class BundleCursor extends MatrixCursor {
+		private Bundle mBundle;
+
+		public BundleCursor(Bundle extras) {
+			super(new String[] {}, 0);
+			mBundle = extras;
+		}
+
+		@Override
+		public Bundle getExtras() {
+			return mBundle;
+		}
+
+		@Override
+		public Bundle respond(Bundle extras) {
+			mBundle = extras;
+			return mBundle;
+		}
 	}
 }

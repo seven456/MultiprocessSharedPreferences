@@ -1,29 +1,28 @@
 # MultiprocessSharedPreferences
-Android 支持多进程同步读写的SharedPreferences (Android support Multi process SharedPreferences)
+Android Multi process SharedPreferences （支持多进程同步读写的SharedPreferences）
 
 ## 说明
-	支持多进程同步读写的SharedPreferences，基于源码android.app.SharedPreferencesImpl（Android 5.L_preview）修改；
-	系统源码android.app.SharedPreferencesImpl（Android 5.L_preview）虽然支持了 {@link Context#MODE_MULTI_PROCESS}，但依然有如下问题： 
-	1、当多个进程同时写同一个文件时，有可能会导致文件损坏或者数据丢失； 
-	2、当多个线程修改同一个文件时，必须使用getSharedPreferences方法才能检查并加载一次数据； 
-	3、OnSharedPreferenceChangeListener不支持多进程； 
-	解决方案： 
-	1、在多进程同时写文件时使用本地文件独占锁FileLock（阻塞的），先加载文件中的数据和内存中的合并后再写入文件，解决文件损坏或者数据丢失问题；
-	2、在多个进程读文件时，当文件正在被修改，也使用文件独占锁（阻塞的），可以得到最新的数值；
-	3、由于文件锁在Linux平台是进程级别，同一进程内的多线程可以多次获得，使用ReentrantLock解决Android（Linux）平台FileLock只能控制进程间的文件锁，在同一个进程内的多线程之间无效和无法互斥的问题；
-	4、使用FileObserver解决多进程监听事件onSharedPreferenceChangeListener；
-	新增优化：
-	1、新增：完全兼容本地已经存储的SharedPreferences文件的读写；
-	2、新增：每个SharedPreferences都使用FileObserver监听文件被修改情况，刷新每个进程中SharedPreferences对象中的数据，不再需要getSharedPreferences才能获得最新数据了；
-	3、新增：使用FileObserver监听文件变化后，与内存中的数据比对，OnSharedPreferenceChangeListener已经可以支持多进程监听；
-	4、修改：采用copy的方式备份主xml文件而不采用SharedPreferencesImpl原来的file.renameTo，是因为file.renameTo会导致FileObserver失效；
-	5、新增：Edit对象的clear()方法删除内存中的数据后执行onSharedPreferenceChangeListener.onSharedPreferenceChanged(sharedPreferences, key)，系统原来的API不执行通知；
-	不足：
-	1、由于使用了进程级别文件锁和文件备份，会多丧失一点效率；
+	使用ContentProvider实现多进程SharedPreferences读写;
+	1、ContentProvider天生支持多进程访问；
+	2、使用内部私有BroadcastReceiver实现多进程OnSharedPreferenceChangeListener监听；
 	
-	使用举例：
-	因为该类实现了系统标准的SharedPreferences接口，只要将“context.getSharedPreferences(name, mode)”改成“MultiprocessSharedPreferences.getSharedPreferences(context, name, mode)”即可；
-	另外mode的{@link Context#MODE_MULTI_PROCESS}状态已经不需要再使用了，因为默认已经支持；
+	使用方法：AndroidManifest.xml中添加provider申明：
+	<provider android:name="com.android.zgj.utils.MultiprocessSharedPreferences"
+		android:authorities="com.qihoo.appstore.MultiprocessSharedPreferences"
+		android:process="com.qihoo.appstore.MultiprocessSharedPreferences"
+		android:exported="false" />
+	<!-- authorities属性里面最好使用包名做前缀，apk在安装时authorities同名的provider需要校验签名，否则无法安装；--!/>
+	
+	ContentProvider方式实现要注意：
+	1、当ContentProvider所在进程android.os.Process.killProcess(pid)时，会导致整个应用程序完全意外退出或者ContentProvider所在进程重启；
+	重启报错信息：Acquiring provider <processName> for user 0: existing object's process dead；
+	2、如果设备处在“安全模式”下，只有系统自带的ContentProvider才能被正常解析使用，因此put值时默认返回false，get值时默认返回null；
+	
+	其他方式实现ContentProvider的问题：
+	使用FileLock和FileObserver也可以实现多进程SharedPreferences读写，但是会有兼容性问题：
+	1、某些设备上卸载程序时锁文件无法删除导致卸载残留，进而导致无法重新安装该程序（报INSTALL_FAILED_UID_CHANGED错误）；
+	2、某些设备上FileLock会导致僵尸进程出现进而导致耗电；
+	3、僵尸进程出现后，正常进程的FileLock会一直阻塞等待僵尸进程中的FileLock释放，导致进程一直阻塞；
 
 ## License
 

@@ -15,23 +15,32 @@ public class CoreService extends Service {
 	private static final String TAG = "CoreService";
 	public static final String SP_NAME = "test";
 	public static final String SP_KEY = "aaa";
+	private SharedPreferences mSharedPreferences;
+	private OnSharedPreferenceChangeListener mOnSharedPreferenceChangeListener;
 	
 	@Override
 	public void onCreate() {
 		super.onCreate();
 		
-		SharedPreferences sharedPreferences = MultiprocessSharedPreferences.getSharedPreferences(this, SP_NAME, Context.MODE_PRIVATE);
-		Log.d(TAG, "onCreate." + SP_KEY + " = " + sharedPreferences.getString(SP_KEY, null));
-		sharedPreferences.registerOnSharedPreferenceChangeListener(new OnSharedPreferenceChangeListener() {
+		mSharedPreferences = MultiprocessSharedPreferences.getSharedPreferences(this, SP_NAME, Context.MODE_PRIVATE);
+		Log.d(TAG, "onCreate." + SP_KEY + " = " + mSharedPreferences.getString(SP_KEY, null));
+		mOnSharedPreferenceChangeListener = new OnSharedPreferenceChangeListener() {
 			@Override
 			public void onSharedPreferenceChanged(SharedPreferences sharedPreferences, String key) {
 				String msg = "onSharedPreferenceChanged." + SP_KEY + " = " + sharedPreferences.getString(SP_KEY, null);
 				Log.d(TAG, msg);
 				Toast.makeText(CoreService.this, msg, Toast.LENGTH_SHORT).show();
 			}
-		});
+		};
+		mSharedPreferences.registerOnSharedPreferenceChangeListener(mOnSharedPreferenceChangeListener);
 	}
 
+	@Override
+	public void onDestroy() {
+		super.onDestroy();
+		mSharedPreferences.unregisterOnSharedPreferenceChangeListener(mOnSharedPreferenceChangeListener);
+	}
+	
 	@Override
 	public IBinder onBind(Intent intent) {
 		return null;
