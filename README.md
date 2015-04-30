@@ -8,8 +8,8 @@ Android Multi process SharedPreferences （支持多进程同步读写的SharedP
 	
 	使用方法：AndroidManifest.xml中添加provider申明：
 	<provider android:name="com.android.zgj.utils.MultiprocessSharedPreferences"
-		android:authorities="com.qihoo.appstore.MultiprocessSharedPreferences"
-		android:process="com.qihoo.appstore.MultiprocessSharedPreferences"
+		android:authorities="com.android.zgj.MultiprocessSharedPreferences"
+		android:process="com.android.zgj.MultiprocessSharedPreferences"
 		android:exported="false" />
 	<!-- authorities属性里面最好使用包名做前缀，apk在安装时authorities同名的provider需要校验签名，否则无法安装；--!/>
 	

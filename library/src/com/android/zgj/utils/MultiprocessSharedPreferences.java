@@ -42,9 +42,9 @@ import android.util.Log;
  * 
  * 使用方法：AndroidManifest.xml中添加provider申明：<br>
  * <pre>
- * &lt;provider android:name="com.qihoo.appstore.utils.MultiprocessSharedPreferences2"
- * android:authorities="com.qihoo.appstore.MultiprocessSharedPreferences"
- * android:process="com.qihoo.appstore.MultiprocessSharedPreferences"
+ * &lt;provider android:name="com.android.zgj.utils.MultiprocessSharedPreferences"
+ * android:authorities="com.android.zgj.MultiprocessSharedPreferences"
+ * android:process="com.android.zgj.MultiprocessSharedPreferences"
  * android:exported="false" /&gt;
  * &lt;!-- authorities属性里面最好使用包名做前缀，apk在安装时authorities同名的provider需要校验签名，否则无法安装；--!/&gt;<br>
  * </pre>
