@@ -18,7 +18,7 @@ Android Multi process SharedPreferences （支持多进程同步读写的SharedP
 	重启报错信息：Acquiring provider <processName> for user 0: existing object's process dead；
 	2、如果设备处在“安全模式”下，只有系统自带的ContentProvider才能被正常解析使用，因此put值时默认返回false，get值时默认返回null；
 	
-	其他方式实现ContentProvider的问题：
+	其他方式实现SharedPreferences的问题：
 	使用FileLock和FileObserver也可以实现多进程SharedPreferences读写，但是会有兼容性问题：
 	1、某些设备上卸载程序时锁文件无法删除导致卸载残留，进而导致无法重新安装该程序（报INSTALL_FAILED_UID_CHANGED错误）；
 	2、某些设备上FileLock会导致僵尸进程出现进而导致耗电；
