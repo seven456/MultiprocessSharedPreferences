@@ -3,7 +3,6 @@
  */
 package com.android.zgj.utils;
 
-import java.lang.ref.SoftReference;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -13,6 +12,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.WeakHashMap;
 
 import com.android.zgj.BuildConfig;
 
@@ -27,12 +27,12 @@ import android.content.SharedPreferences;
 import android.content.UriMatcher;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
-import android.content.pm.PackageManager.NameNotFoundException;
 import android.content.pm.ProviderInfo;
 import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.DeadObjectException;
 import android.util.Log;
 
 /**
@@ -71,7 +71,8 @@ public class MultiprocessSharedPreferences extends ContentProvider implements Sh
 	private String mName;
 	private int mMode;
 	private boolean mIsSafeMode;
-	private List<SoftReference<OnSharedPreferenceChangeListener>> mListeners;
+	private static final Object CONTENT = new Object();
+	private WeakHashMap<OnSharedPreferenceChangeListener, Object> mListeners;
 	private BroadcastReceiver mReceiver;
 
 	private static String AUTHORITY;
@@ -102,7 +103,7 @@ public class MultiprocessSharedPreferences extends ContentProvider implements Sh
 	private static final int COMMIT = 9;
 	private static final int REGISTER_ON_SHARED_PREFERENCE_CHANGE_LISTENER = 10;
 	private static final int UNREGISTER_ON_SHARED_PREFERENCE_CHANGE_LISTENER = 11;
-	private Map<String, Integer> mListenersCount;
+	private WeakHashMap<String, Integer> mListenersCount;
 
 	private static class ReflectionUtil {
 
@@ -154,43 +155,62 @@ public class MultiprocessSharedPreferences extends ContentProvider implements Sh
 			}
 		}
 	}
-	
+
+	// 如果设备处在“安全模式”下，只有系统自带的ContentProvider才能被正常解析使用；
+	private boolean isSafeMode(Context context) {
+		boolean isSafeMode = false;
+		try {
+			isSafeMode = context.getPackageManager().isSafeMode(); // 解决崩溃：java.lang.RuntimeException: Package manager has died at android.app.ApplicationPackageManager.isSafeMode(ApplicationPackageManager.java:820)
+		} catch (RuntimeException e) {
+			if (!isPackageManagerHasDied(e)) {
+				throw e;
+			}
+		}
+		return isSafeMode;
+	}
+
 	private void checkInitAuthority(Context context) {
 		if (AUTHORITY_URI == null) {
 			synchronized (MultiprocessSharedPreferences.this) {
 				if (AUTHORITY_URI == null) {
-					AUTHORITY = queryAuthority(context);
+					PackageInfo packageInfos = null;
+					try {
+						/** {@link #isPackageManagerHasDied } 需要额外处理的异常：java.lang.RuntimeException: Package manager has died at android.app.ApplicationPackageManager.getPackageInfo(ApplicationPackageManager.java:77) */
+						packageInfos = context.getPackageManager().getPackageInfo(context.getPackageName(), PackageManager.GET_PROVIDERS);
+					} catch (PackageManager.NameNotFoundException e) {
+						if (DEBUG) {
+							e.printStackTrace();
+						}
+					}
+					if (packageInfos != null && packageInfos.providers != null) {
+						for (ProviderInfo providerInfo : packageInfos.providers) {
+							if (providerInfo.name.equals(MultiprocessSharedPreferences.class.getName())) {
+								AUTHORITY = providerInfo.authority;
+								break;
+							}
+						}
+					}
+					if (AUTHORITY == null) {
+						throw new IllegalArgumentException("'AUTHORITY' initialize failed, Unable to find explicit provider class " + MultiprocessSharedPreferences.class.getName() + "; have you declared this provider in your AndroidManifest.xml?");
+					}
 					AUTHORITY_URI = Uri.parse(ContentResolver.SCHEME_CONTENT + "://" + AUTHORITY);
 					if (DEBUG) {
 						Log.d(TAG, "checkInitAuthority.AUTHORITY = " + AUTHORITY);
 					}
 				}
-				if (AUTHORITY == null) {
-					throw new IllegalArgumentException("'AUTHORITY' initialize failed.");
-				}
 			}
 		}
 	}
 
-	private static String queryAuthority(Context context) {
-		PackageInfo packageInfos = null;
-		try {
-			packageInfos = context.getPackageManager().getPackageInfo(context.getPackageName(), PackageManager.GET_PROVIDERS);
-		} catch (NameNotFoundException e) {
-			if (DEBUG) {
-				e.printStackTrace();
-			}
-		}
-		if (packageInfos != null && packageInfos.providers != null) {
-			for (ProviderInfo providerInfo : packageInfos.providers) {
-				if (providerInfo.name.equals(MultiprocessSharedPreferences.class.getName())) {
-					return providerInfo.authority;
-				}
-			}
-		}
-		return null;
+	// java.lang.RuntimeException: Package manager has died at android.app.ApplicationPackageManager.getPackageInfo(ApplicationPackageManager.java:80) ... Caused by: android.os.DeadObjectException at android.os.BinderProxy.transact(Native Method) at android.content.pm.IPackageManager$Stub$Proxy.getPackageInfo(IPackageManager.java:1374)
+	private boolean isPackageManagerHasDied(Exception e) {
+		return e instanceof  RuntimeException
+				&& e.getMessage() != null
+				&& e.getMessage().contains("Package manager has died")
+				&& e.getCause() != null
+				&& e.getCause() instanceof DeadObjectException;
 	}
-	
+
 	/**
 	 * mode不使用{@link Context#MODE_MULTI_PROCESS}特可以支持多进程了；
 	 * 
@@ -216,58 +236,50 @@ public class MultiprocessSharedPreferences extends ContentProvider implements Sh
 		mContext = context;
 		mName = name;
 		mMode = mode;
-		mIsSafeMode = context.getPackageManager().isSafeMode(); // 如果设备处在“安全模式”下，只有系统自带的ContentProvider才能被正常解析使用；
+		mIsSafeMode = isSafeMode(mContext);
 	}
 
 	@SuppressWarnings("unchecked")
 	@Override
 	public Map<String, ?> getAll() {
-		return (Map<String, ?>) getValue(PATH_GET_ALL, null, null);
+		Map<String, ?> v = (Map<String, ?>) getValue(PATH_GET_ALL, null, null);
+		return v != null ? v : new HashMap<String, Object>();
 	}
 
 	@Override
 	public String getString(String key, String defValue) {
-		String v = (String) getValue(PATH_GET_STRING, key, defValue);
-		return v != null ? v : defValue;
+		return (String) getValue(PATH_GET_STRING, key, defValue);
 	}
 
 	// @Override // Android 3.0
+	@SuppressWarnings("unchecked")
 	public Set<String> getStringSet(String key, Set<String> defValues) {
-		synchronized (this) {
-			@SuppressWarnings("unchecked")
-			Set<String> v = (Set<String>) getValue(PATH_GET_STRING, key, defValues);
-			return v != null ? v : defValues;
-		}
+		return (Set<String>) getValue(PATH_GET_STRING, key, defValues);
 	}
 
 	@Override
 	public int getInt(String key, int defValue) {
-		Integer v = (Integer) getValue(PATH_GET_INT, key, defValue);
-		return v != null ? v : defValue;
+		return (Integer) getValue(PATH_GET_INT, key, defValue);
 	}
 
 	@Override
 	public long getLong(String key, long defValue) {
-		Long v = (Long) getValue(PATH_GET_LONG, key, defValue);
-		return v != null ? v : defValue;
+		return (Long) getValue(PATH_GET_LONG, key, defValue);
 	}
 
 	@Override
 	public float getFloat(String key, float defValue) {
-		Float v = (Float) getValue(PATH_GET_FLOAT, key, defValue);
-		return v != null ? v : defValue;
+		return (Float) getValue(PATH_GET_FLOAT, key, defValue);
 	}
 
 	@Override
 	public boolean getBoolean(String key, boolean defValue) {
-		Boolean v = (Boolean) getValue(PATH_GET_BOOLEAN, key, defValue);
-		return v != null ? v : defValue;
+		return (Boolean) getValue(PATH_GET_BOOLEAN, key, defValue);
 	}
 
 	@Override
 	public boolean contains(String key) {
-		Boolean v = (Boolean) getValue(PATH_CONTAINS, key, null);
-		return v != null ? v : false;
+		return (Boolean) getValue(PATH_CONTAINS, key, null);
 	}
 
 	@Override
@@ -279,11 +291,11 @@ public class MultiprocessSharedPreferences extends ContentProvider implements Sh
 	public void registerOnSharedPreferenceChangeListener(OnSharedPreferenceChangeListener listener) {
 		synchronized (this) {
 			if (mListeners == null) {
-				mListeners = new ArrayList<SoftReference<OnSharedPreferenceChangeListener>>();
+				mListeners = new WeakHashMap<OnSharedPreferenceChangeListener, Object>();
 			}
 			Boolean result = (Boolean) getValue(PATH_REGISTER_ON_SHARED_PREFERENCE_CHANGE_LISTENER, null, false);
 			if (result != null && result) {
-				mListeners.add(new SoftReference<OnSharedPreferenceChangeListener>(listener));
+				mListeners.put(listener, CONTENT);
 				if (mReceiver == null) {
 					mReceiver = new BroadcastReceiver() {
 						@Override
@@ -292,11 +304,10 @@ public class MultiprocessSharedPreferences extends ContentProvider implements Sh
 							@SuppressWarnings("unchecked")
 							List<String> keysModified = (List<String>) intent.getSerializableExtra(KEY);
 							if (mName.equals(name) && keysModified != null) {
-								List<SoftReference<OnSharedPreferenceChangeListener>> listeners = new ArrayList<SoftReference<OnSharedPreferenceChangeListener>>(mListeners);
+								Set<OnSharedPreferenceChangeListener> listeners = new HashSet<OnSharedPreferenceChangeListener>(mListeners.keySet());
 								for (int i = keysModified.size() - 1; i >= 0; i--) {
 									final String key = keysModified.get(i);
-									for (SoftReference<OnSharedPreferenceChangeListener> srlistener : listeners) {
-										OnSharedPreferenceChangeListener listener = srlistener.get();
+									for (OnSharedPreferenceChangeListener listener : listeners) {
 										if (listener != null) {
 											listener.onSharedPreferenceChanged(MultiprocessSharedPreferences.this, key);
 										}
@@ -314,18 +325,11 @@ public class MultiprocessSharedPreferences extends ContentProvider implements Sh
 	@Override
 	public void unregisterOnSharedPreferenceChangeListener(OnSharedPreferenceChangeListener listener) {
 		synchronized (this) {
-			getValue(PATH_UNREGISTER_ON_SHARED_PREFERENCE_CHANGE_LISTENER, null, false);
+			getValue(PATH_UNREGISTER_ON_SHARED_PREFERENCE_CHANGE_LISTENER, null, false); // WeakHashMap
 			if (mListeners != null) {
-				for (SoftReference<OnSharedPreferenceChangeListener> srlistener : mListeners) {
-					OnSharedPreferenceChangeListener listenerFromSR = srlistener.get();
-					if (listenerFromSR != null && listenerFromSR.equals(listener)) {
-						mListeners.remove(srlistener);
-					}
-				}
+				mListeners.remove(listener);
 				if (mListeners.isEmpty() && mReceiver != null) {
 					mContext.unregisterReceiver(mReceiver);
-					mReceiver = null;
-					mListeners = null;
 				}
 			}
 		}
@@ -410,41 +414,87 @@ public class MultiprocessSharedPreferences extends ContentProvider implements Sh
 		}
 
 		private boolean setValue(String pathSegment) {
+			boolean result = false;
 			if (mIsSafeMode) { // 如果设备处在“安全模式”，返回false；
-				return false;
-			} else {
-				synchronized (MultiprocessSharedPreferences.this) {
-					checkInitAuthority(mContext);
-					String[] selectionArgs = new String[] { String.valueOf(mMode), String.valueOf(mClear) };
-					synchronized (this) {
-						Uri uri = Uri.withAppendedPath(Uri.withAppendedPath(AUTHORITY_URI, mName), pathSegment);
-						ContentValues values = ReflectionUtil.contentValuesNewInstance((HashMap<String, Object>) mModified);
-						return mContext.getContentResolver().update(uri, values, null, selectionArgs) > 0;
+				return result;
+			}
+			try {
+				checkInitAuthority(mContext);
+			} catch (RuntimeException e) { // 解决崩溃：java.lang.RuntimeException: Package manager has died at android.app.ApplicationPackageManager.getPackageInfo(ApplicationPackageManager.java:77)
+				if (isPackageManagerHasDied(e)) {
+					return result;
+				} else {
+					throw e;
+				}
+			}
+			String[] selectionArgs = new String[] { String.valueOf(mMode), String.valueOf(mClear) };
+			synchronized (this) {
+				Uri uri = Uri.withAppendedPath(Uri.withAppendedPath(AUTHORITY_URI, mName), pathSegment);
+				ContentValues values = ReflectionUtil.contentValuesNewInstance((HashMap<String, Object>) mModified);
+				try {
+					result = mContext.getContentResolver().update(uri, values, null, selectionArgs) > 0;
+				} catch (IllegalArgumentException e) { // 解决ContentProvider所在进程被杀时的抛出的异常：java.lang.IllegalArgumentException: Unknown URI content://xxx.xxx.xxx/xxx/xxx at android.content.ContentResolver.update(ContentResolver.java:1312)
+					if (DEBUG) {
+						e.printStackTrace();
+					}
+				} catch (RuntimeException e) { // 解决崩溃：java.lang.RuntimeException: Package manager has died at android.app.ApplicationPackageManager.resolveContentProvider(ApplicationPackageManager.java:609) ... at android.content.ContentResolver.update(ContentResolver.java:1310)
+					if (isPackageManagerHasDied(e)) {
+						return result;
+					} else {
+						throw e;
 					}
 				}
 			}
+			return result;
 		}
 	}
 
 	private Object getValue(String pathSegment, String key, Object defValue) {
-		if (mIsSafeMode) { // 如果设备处在“安全模式”，返回null；
-			return null;
-		} else {
-			checkInitAuthority(mContext);
-			Object v = null;
-			Uri uri = Uri.withAppendedPath(Uri.withAppendedPath(AUTHORITY_URI, mName), pathSegment);
-			String[] selectionArgs = new String[] { String.valueOf(mMode), key, defValue == null ? null : String.valueOf(defValue) };
-			Cursor cursor = mContext.getContentResolver().query(uri, null, null, selectionArgs, null);
-			if (cursor != null) {
-				Bundle bundle = cursor.getExtras();
-				if (bundle != null) {
-					v = bundle.get(KEY);
-					bundle.clear();
-				}
-				cursor.close();
-			}
-			return v != null ? v : defValue;
+		Object v = null;
+		if (mIsSafeMode) { // 如果设备处在“安全模式”，返回defValue；
+			return defValue;
 		}
+		try {
+			checkInitAuthority(mContext);
+		} catch (RuntimeException e) { // 解决崩溃：java.lang.RuntimeException: Package manager has died at android.app.ApplicationPackageManager.getPackageInfo(ApplicationPackageManager.java:77)
+			if (isPackageManagerHasDied(e)) {
+				return defValue;
+			} else {
+				throw e;
+			}
+		}
+		Uri uri = Uri.withAppendedPath(Uri.withAppendedPath(AUTHORITY_URI, mName), pathSegment);
+		String[] selectionArgs = new String[] { String.valueOf(mMode), key, defValue == null ? null : String.valueOf(defValue) };
+		Cursor cursor = null;
+		try {
+			cursor = mContext.getContentResolver().query(uri, null, null, selectionArgs, null);
+		} catch (SecurityException e) { // 解决崩溃：java.lang.SecurityException: Permission Denial: reading com.qihoo.storager.MultiprocessSharedPreferences uri content://com.qihoo.appstore.MultiprocessSharedPreferences/LogUtils/getBoolean from pid=2446, uid=10116 requires the provider be exported, or grantUriPermission() at android.content.ContentProvider$Transport.enforceReadPermission(ContentProvider.java:332) ... at android.content.ContentResolver.query(ContentResolver.java:317)
+			if (DEBUG) {
+				e.printStackTrace();
+			}
+		} catch (RuntimeException e) { // 解决崩溃：java.lang.RuntimeException: Package manager has died at android.app.ApplicationPackageManager.resolveContentProvider(ApplicationPackageManager.java:609) ... at android.content.ContentResolver.query(ContentResolver.java:404)
+			if (isPackageManagerHasDied(e)) {
+				return defValue;
+			} else {
+				throw e;
+			}
+		}
+		if (cursor != null) {
+			Bundle bundle = null;
+			try {
+				bundle = cursor.getExtras();
+			} catch (RuntimeException e) { // 解决ContentProvider所在进程被杀时的抛出的异常：java.lang.RuntimeException: android.os.DeadObjectException at android.database.BulkCursorToCursorAdaptor.getExtras(BulkCursorToCursorAdaptor.java:173) at android.database.CursorWrapper.getExtras(CursorWrapper.java:94)
+				if (DEBUG) {
+					e.printStackTrace();
+				}
+			}
+			if (bundle != null) {
+				v = bundle.get(KEY);
+				bundle.clear();
+			}
+			cursor.close();
+		}
+		return v != null ? v : defValue;
 	}
 
 	private String makeAction(String name) {
@@ -631,26 +681,10 @@ public class MultiprocessSharedPreferences extends ContentProvider implements Sh
 		}
 		return result;
 	}
-	
-	@Override
-	public void onLowMemory() {
-		if (mListenersCount != null) {
-			mListenersCount.clear();
-		}
-		super.onLowMemory();
-	}
-	
-	@Override
-	public void onTrimMemory(int level) {
-		if (mListenersCount != null) {
-			mListenersCount.clear();
-		}
-		super.onTrimMemory(level);
-	}
-	
+
 	private void checkInitListenersCount() {
 		if (mListenersCount == null) {
-			mListenersCount = new HashMap<String, Integer>();
+			mListenersCount = new WeakHashMap<String, Integer>();
 		}
 	}
 
