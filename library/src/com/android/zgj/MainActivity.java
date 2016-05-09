@@ -27,6 +27,7 @@ public class MainActivity extends Activity {
 		startService(new Intent(this, CoreService.class)); // Across processes
 
 		final SharedPreferences sharedPreferences = MultiprocessSharedPreferences.getSharedPreferences(this, CoreService.SP_NAME, Context.MODE_PRIVATE);
+		mEditText.setText(sharedPreferences.getString(CoreService.SP_KEY, null));
 		mEditText.addTextChangedListener(new TextWatcher() {
 			@Override
 			public void onTextChanged(CharSequence s, int start, int before, int count) {
@@ -38,10 +39,10 @@ public class MainActivity extends Activity {
 
 			@Override
 			public void afterTextChanged(Editable s) {
-				boolean commit = sharedPreferences.edit().putString(CoreService.SP_KEY, mEditText.getText().toString()).commit();
-				Log.d(TAG, "commit = " + commit);
+				String value = mEditText.getText().toString();
+				boolean commit = sharedPreferences.edit().putString(CoreService.SP_KEY, value).commit();
+				Log.d(TAG, "value = " + value + ", commit = " + commit);
 			}
 		});
-
 	}
 }

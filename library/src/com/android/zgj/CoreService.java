@@ -38,6 +38,7 @@ public class CoreService extends Service {
 	@Override
 	public void onDestroy() {
 		super.onDestroy();
+		Log.d(TAG, "onCreate." + SP_KEY + " = " + mSharedPreferences.getString(SP_KEY, null));
 		mSharedPreferences.unregisterOnSharedPreferenceChangeListener(mOnSharedPreferenceChangeListener);
 	}
 	
