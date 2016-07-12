@@ -27,6 +27,7 @@ import android.support.annotation.NonNull;
 import android.util.Log;
 
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
@@ -172,15 +173,30 @@ public class MultiprocessSharedPreferences extends ContentProvider implements Sh
 				throw new RuntimeException(e);
 			}
 		}
+
+		public static String contentProvidermAuthority(ContentProvider contentProvider) {
+			try {
+				Field mAuthority = ContentProvider.class.getDeclaredField("mAuthority"); // Android 5.0
+				mAuthority.setAccessible(true);
+				return (String) mAuthority.get(contentProvider);
+			} catch (NoSuchFieldException e) {
+				throw new RuntimeException(e);
+			} catch (IllegalAccessException e) {
+				throw new RuntimeException(e);
+			}
+		}
 	}
 
 	// 如果设备处在“安全模式”下，只有系统自带的ContentProvider才能被正常解析使用；
 	private boolean isSafeMode(Context context) {
 		boolean isSafeMode = false;
 		try {
-			isSafeMode = context.getPackageManager().isSafeMode(); // 解决崩溃：java.lang.RuntimeException: Package manager has died at android.app.ApplicationPackageManager.isSafeMode(ApplicationPackageManager.java:820)
+			isSafeMode = context.getPackageManager().isSafeMode();
+			// 解决崩溃：
+			// java.lang.RuntimeException: Package manager has died
+			// at android.app.ApplicationPackageManager.isSafeMode(ApplicationPackageManager.java:820)
 		} catch (RuntimeException e) {
-			if (!isPackageManagerHasDied(e)) {
+			if (!isPackageManagerHasDiedException(e)) {
 				throw e;
 			}
 		}
@@ -188,7 +204,7 @@ public class MultiprocessSharedPreferences extends ContentProvider implements Sh
 	}
 	
 	/**
-	 * （可选）设置AUTHORITY，不用在初始化时遍历程序的AndroidManifest文件获取android:authorities的值，减少初始化时间提高运行速度；
+	 * （可选）设置AUTHORITY，不用在初始化时遍历程序的AndroidManifest.xml文件获取android:authorities的值，减少初始化时间提高运行速度；
 	 * @param authority
 	 */
 	public static void setAuthority(String authority) {
@@ -200,23 +216,27 @@ public class MultiprocessSharedPreferences extends ContentProvider implements Sh
 			synchronized (MultiprocessSharedPreferences.this) {
 				if (AUTHORITY_URI == null) {
 					if(AUTHORITY == null) {
-						PackageInfo packageInfos = null;
-						try {
-							packageInfos = context.getPackageManager().getPackageInfo(context.getPackageName(), PackageManager.GET_PROVIDERS);
-						} catch (PackageManager.NameNotFoundException e) {
-							if (DEBUG) {
-								e.printStackTrace();
+						if (Build.VERSION.SDK_INT >= 21 && this instanceof ContentProvider) {
+							AUTHORITY = ReflectionUtil.contentProvidermAuthority(this);
+						} else {
+							PackageInfo packageInfos = null;
+							try {
+								packageInfos = context.getPackageManager().getPackageInfo(context.getPackageName(), PackageManager.GET_PROVIDERS);
+							} catch (PackageManager.NameNotFoundException e) {
+								if (DEBUG) {
+									e.printStackTrace();
+								}
+							} catch (RuntimeException e) {
+								if (!isPackageManagerHasDiedException(e)) {
+									throw new RuntimeException("checkInitAuthority", e);
+								}
 							}
-						} catch (RuntimeException e) {
-							if (!isPackageManagerHasDied(e)) {
-								throw new RuntimeException("checkInitAuthority", e);
-							}
-						}
-						if (packageInfos != null && packageInfos.providers != null) {
-							for (ProviderInfo providerInfo : packageInfos.providers) {
-								if (providerInfo.name.equals(MultiprocessSharedPreferences.class.getName())) {
-									AUTHORITY = providerInfo.authority;
-									break;
+							if (packageInfos != null && packageInfos.providers != null) {
+								for (ProviderInfo providerInfo : packageInfos.providers) {
+									if (providerInfo.name.equals(MultiprocessSharedPreferences.class.getName())) {
+										AUTHORITY = providerInfo.authority;
+										break;
+									}
 								}
 							}
 						}
@@ -235,28 +255,81 @@ public class MultiprocessSharedPreferences extends ContentProvider implements Sh
 		return AUTHORITY_URI != null;
 	}
 
-	// java.lang.RuntimeException: Package manager has died at android.app.ApplicationPackageManager.getPackageInfo(ApplicationPackageManager.java:80) ... Caused by: android.os.DeadObjectException at android.os.BinderProxy.transact(Native Method) at android.content.pm.IPackageManager$Stub$Proxy.getPackageInfo(IPackageManager.java:1374)
-	private boolean isPackageManagerHasDied(Exception e) {
-		return e instanceof  RuntimeException
+	private boolean isPackageManagerHasDiedException(Throwable e) {
+//		1、packageManager.getPackageInfo
+//		java.lang.RuntimeException: Package manager has died
+//		at android.app.ApplicationPackageManager.getPackageInfo(ApplicationPackageManager.java:80)
+//		...
+//		Caused by: android.os.DeadObjectException
+//		at android.os.BinderProxy.transact(Native Method)
+//		at android.content.pm.IPackageManager$Stub$Proxy.getPackageInfo(IPackageManager.java:1374)
+
+//		2、contentResolver.query
+//		java.lang.RuntimeException: Package manager has died
+//		at android.app.ApplicationPackageManager.resolveContentProvider(ApplicationPackageManager.java:636)
+//		at android.app.ActivityThread.acquireProvider(ActivityThread.java:4750)
+//		at android.app.ContextImpl$ApplicationContentResolver.acquireUnstableProvider(ContextImpl.java:2234)
+//		at android.content.ContentResolver.acquireUnstableProvider(ContentResolver.java:1425)
+//		at android.content.ContentResolver.query(ContentResolver.java:445)
+//		at android.content.ContentResolver.query(ContentResolver.java:404)
+//		at com.qihoo.storager.MultiprocessSharedPreferences.getValue(AppStore:502)
+//		...
+//		Caused by: android.os.TransactionTooLargeException
+//		at android.os.BinderProxy.transact(Native Method)
+//		at android.content.pm.IPackageManager$Stub$Proxy.resolveContentProvider(IPackageManager.java:2500)
+//		at android.app.ApplicationPackageManager.resolveContentProvider(ApplicationPackageManager.java:634)
+		if (e instanceof  RuntimeException
 				&& e.getMessage() != null
-				&& e.getMessage().contains("Package manager has died")
-				&& e.getCause() != null
-				&& e.getCause() instanceof DeadObjectException;
+				&& e.getMessage().contains("Package manager has died")) {
+			Throwable cause = getLastCause(e);
+			if (cause instanceof DeadObjectException || cause.getClass().getName().equals("android.os.TransactionTooLargeException")) {
+				return true;
+			}
+		}
+		return false;
 	}
 
-	private boolean isUnstableCountException(Exception e) {
-//		java.lang.IllegalStateException: unstableCount < 0: -1
-//		at android.os.Parcel.readException(Parcel.java:1433)
-//		at android.os.Parcel.readException(Parcel.java:1379)
-//		at android.app.ActivityManagerProxy.refContentProvider(ActivityManagerNative.java:2631)
-//		at android.app.ActivityThread.releaseProvider(ActivityThread.java:4494)
-//		at android.app.ContextImpl$ApplicationContentResolver.releaseUnstableProvider(ContextImpl.java:1995)
-//		at android.content.ContentResolver.query(ContentResolver.java:404)
-//		at android.content.ContentResolver.query(ContentResolver.java:315)
-//		at com.qihoo.storager.MultiprocessSharedPreferences.getValue(AppStore:464)
-		return e instanceof  IllegalStateException
+	private boolean isUnstableCountException(Throwable e) {
+//		java.lang.RuntimeException: java.lang.IllegalStateException: unstableCount < 0: -1
+//		at com.qihoo.storager.MultiprocessSharedPreferences.getValue(AppStore:459)
+//		at com.qihoo.storager.MultiprocessSharedPreferences.getBoolean(AppStore:282)
+//		...
+//		Caused by: java.lang.IllegalStateException: unstableCount < 0: -1
+//		at android.os.Parcel.readException(Parcel.java:1628)
+//		at android.os.Parcel.readException(Parcel.java:1573)
+//		at android.app.ActivityManagerProxy.refContentProvider(ActivityManagerNative.java:3680)
+//		at android.app.ActivityThread.releaseProvider(ActivityThread.java:5052)
+//		at android.app.ContextImpl$ApplicationContentResolver.releaseUnstableProvider(ContextImpl.java:2036)
+//		at android.content.ContentResolver.query(ContentResolver.java:534)
+//		at android.content.ContentResolver.query(ContentResolver.java:435)
+//		at com.qihoo.storager.MultiprocessSharedPreferences.a(AppStore:452)
+		if (e instanceof  RuntimeException
 				&& e.getMessage() != null
-				&& e.getMessage().contains("unstableCount < 0: -1");
+				&& e.getMessage().contains("unstableCount < 0: -1")) {
+			if (getLastCause(e) instanceof IllegalStateException) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * 获取异常栈中最底层的 Throwable Cause；
+	 *
+	 * @param tr
+	 * @return
+     */
+	private Throwable getLastCause(Throwable tr) {
+		Throwable cause = tr.getCause();
+		Throwable causeLast = null;
+		while (cause != null) {
+			causeLast = cause;
+			cause = cause.getCause();
+		}
+		if (causeLast == null) {
+			causeLast = new Throwable();
+		}
+		return causeLast;
 	}
 
 	/**
@@ -470,16 +543,22 @@ public class MultiprocessSharedPreferences extends ContentProvider implements Sh
 					ContentValues values = ReflectionUtil.contentValuesNewInstance((HashMap<String, Object>) mModified);
 					try {
 						result = mContext.getContentResolver().update(uri, values, null, selectionArgs) > 0;
-					} catch (IllegalArgumentException e) { // 解决ContentProvider所在进程被杀时的抛出的异常：java.lang.IllegalArgumentException: Unknown URI content://xxx.xxx.xxx/xxx/xxx at android.content.ContentResolver.update(ContentResolver.java:1312)
+					} catch (IllegalArgumentException e) {
+						// 解决ContentProvider所在进程被杀时的抛出的异常：
+						// java.lang.IllegalArgumentException: Unknown URI content://xxx.xxx.xxx/xxx/xxx
+						// at android.content.ContentResolver.update(ContentResolver.java:1312)
 						if (DEBUG) {
 							e.printStackTrace();
 						}
-					} catch (RuntimeException e) { // 解决崩溃：java.lang.RuntimeException: Package manager has died at android.app.ApplicationPackageManager.resolveContentProvider(ApplicationPackageManager.java:609) ... at android.content.ContentResolver.update(ContentResolver.java:1310)
-						if (!isPackageManagerHasDied(e)) {
+					} catch (RuntimeException e) {
+						if (!isPackageManagerHasDiedException(e) && !isUnstableCountException(e)) {
 							throw new RuntimeException(e);
 						}
 					}
 				}
+			}
+			if (DEBUG) {
+				Log.d(TAG, "setValue.mName = " + mName + ", pathSegment = " + pathSegment + ", mModified.size() = " + mModified.size());
 			}
 			return result;
 		}
@@ -500,12 +579,17 @@ public class MultiprocessSharedPreferences extends ContentProvider implements Sh
 			Cursor cursor = null;
 			try {
 				cursor = mContext.getContentResolver().query(uri, projection, null, selectionArgs, null);
-			} catch (SecurityException e) { // 解决崩溃：java.lang.SecurityException: Permission Denial: reading com.qihoo.storager.MultiprocessSharedPreferences uri content://com.qihoo.appstore.MultiprocessSharedPreferences/LogUtils/getBoolean from pid=2446, uid=10116 requires the provider be exported, or grantUriPermission() at android.content.ContentProvider$Transport.enforceReadPermission(ContentProvider.java:332) ... at android.content.ContentResolver.query(ContentResolver.java:317)
+			} catch (SecurityException e) {
+				// 解决崩溃：
+				// java.lang.SecurityException: Permission Denial: reading com.qihoo.storager.MultiprocessSharedPreferences uri content://com.qihoo.appstore.MultiprocessSharedPreferences/LogUtils/getBoolean from pid=2446, uid=10116 requires the provider be exported, or grantUriPermission()
+				// at android.content.ContentProvider$Transport.enforceReadPermission(ContentProvider.java:332)
+				// ...
+				// at android.content.ContentResolver.query(ContentResolver.java:317)
 				if (DEBUG) {
 					e.printStackTrace();
 				}
-			} catch (RuntimeException e) { // 解决崩溃：java.lang.RuntimeException: Package manager has died at android.app.ApplicationPackageManager.resolveContentProvider(ApplicationPackageManager.java:609) ... at android.content.ContentResolver.query(ContentResolver.java:404)
-				if (!isPackageManagerHasDied(e) && !isUnstableCountException(e)) {
+			} catch (RuntimeException e) {
+				if (!isPackageManagerHasDiedException(e) && !isUnstableCountException(e)) {
 					throw new RuntimeException(e);
 				}
 			}
@@ -513,7 +597,11 @@ public class MultiprocessSharedPreferences extends ContentProvider implements Sh
 				Bundle bundle = null;
 				try {
 					bundle = cursor.getExtras();
-				} catch (RuntimeException e) { // 解决ContentProvider所在进程被杀时的抛出的异常：java.lang.RuntimeException: android.os.DeadObjectException at android.database.BulkCursorToCursorAdaptor.getExtras(BulkCursorToCursorAdaptor.java:173) at android.database.CursorWrapper.getExtras(CursorWrapper.java:94)
+				} catch (RuntimeException e) {
+					// 解决ContentProvider所在进程被杀时的抛出的异常：
+					// java.lang.RuntimeException: android.os.DeadObjectException
+					// at android.database.BulkCursorToCursorAdaptor.getExtras(BulkCursorToCursorAdaptor.java:173)
+					// at android.database.CursorWrapper.getExtras(CursorWrapper.java:94)
 					if (DEBUG) {
 						e.printStackTrace();
 					}
@@ -524,6 +612,9 @@ public class MultiprocessSharedPreferences extends ContentProvider implements Sh
 				}
 				cursor.close();
 			}
+		}
+		if (DEBUG) {
+			Log.d(TAG, "getValue.mName = " + mName + ", pathSegment = " + pathSegment + ", key = " + key + ", defValue = " + defValue);
 		}
 		return v == null ? defValue : v;
 	}
@@ -617,7 +708,7 @@ public class MultiprocessSharedPreferences extends ContentProvider implements Sh
 			}
 			default:
 				if (DEBUG) {
-					throw new IllegalArgumentException("At query, This is Unknown Uri：" + uri);
+					throw new IllegalArgumentException("At query, This is Unknown Uri：" + uri + ", AUTHORITY = " + AUTHORITY);
 				}
 		}
 		return new BundleCursor(bundle);
@@ -709,7 +800,7 @@ public class MultiprocessSharedPreferences extends ContentProvider implements Sh
 				break;
 			default:
 				if (DEBUG) {
-					throw new IllegalArgumentException("At update, This is Unknown Uri：" + uri);
+					throw new IllegalArgumentException("At update, This is Unknown Uri：" + uri + ", AUTHORITY = " + AUTHORITY);
 				}
 		}
 		return result;
