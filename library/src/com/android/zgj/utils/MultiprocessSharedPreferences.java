@@ -706,6 +706,7 @@ public class MultiprocessSharedPreferences extends ContentProvider implements Sh
 					bundle.putSerializable(KEY, (HashSet<String>) ReflectionUtil.sharedPreferencesGetStringSet(getSystemSharedPreferences(name, mode), key, set));
 				}
 			}
+				break;
 			default:
 				if (DEBUG) {
 					throw new IllegalArgumentException("At query, This is Unknown Uri：" + uri + ", AUTHORITY = " + AUTHORITY);
